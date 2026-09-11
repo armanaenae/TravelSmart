@@ -315,11 +315,6 @@ async function handleAuthChange(user) {
     // Push local trips that don't have ownerUid (first-run only)
     await migrateLocalToCloud();
     renderTripsList();
-    // Handle pending invite from URL, if any
-    if (state._pendingInvite) {
-      // Give listeners a beat, then check
-      setTimeout(() => tryAcceptPendingInvite(), 500);
-    }
   } else {
     // Signed out — clear local + cloud subs + gate
     stopCloudSync();
@@ -1476,8 +1471,8 @@ async function renderPeopleTab() {
     }
   }
 
-  // Share link UI
-  await renderShareLinkUI();
+  // Join code UI
+  await renderJoinCodeUI();
 }
 
 async function handleInviteCollaborator(e) {
@@ -1536,211 +1531,263 @@ async function handleRemoveCollaborator(email) {
 }
 
 /* =============================================================
- * SHARE LINK / INVITE FLOW
+ * TRIP CODE (JOIN BY CODE)
+ *
+ * We keep a small side-collection `joinCodes/{CODE}` -> { tripId, ownerUid }.
+ * The trip doc also stores `joinCode` so we can display/revoke.
+ * Firestore rules:
+ *   - joinCodes: any signed-in user can `get` (to look up a code)
+ *                only the owner can create/delete their code doc
+ *   - trips: existing rules + `isSelfJoinViaCode` lets a signed-in user
+ *            add ONLY their own email to `collaborators` if the trip's
+ *            joinCode matches an existing joinCodes doc they can read
  * ============================================================= */
-function randomShareToken() {
-  const bytes = new Uint8Array(16);
+
+// Human-readable random codes: prefix (from trip name if possible) + 4-char base32
+function randomCode(prefix) {
+  const alpha = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/1/O/I confusion
+  const bytes = new Uint8Array(4);
   crypto.getRandomValues(bytes);
-  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+  let suffix = '';
+  for (let i = 0; i < 4; i++) suffix += alpha[bytes[i] % alpha.length];
+  const p = (prefix || 'TRIP').toUpperCase().replace(/[^A-Z]/g, '').slice(0, 6) || 'TRIP';
+  return `${p}-${suffix}`;
 }
 
-function buildInviteUrl(tripId, token) {
-  const url = new URL(window.location.href);
-  url.search = '';
-  url.hash = '';
-  url.searchParams.set('join', String(tripId));
-  url.searchParams.set('t', token);
-  return url.toString();
+function joinCodesDoc(code) {
+  return state.firestore.collection('joinCodes').doc(code.toUpperCase());
 }
 
-async function renderShareLinkUI() {
+async function renderJoinCodeUI() {
   const trip = await getTrip(state.currentTripId);
   if (!trip) return;
-  const emptyEl = document.getElementById('share-link-empty');
-  const activeEl = document.getElementById('share-link-active');
-  const inputEl = document.getElementById('share-link-input');
-  const genBtn = document.getElementById('share-link-generate');
-  const revBtn = document.getElementById('share-link-revoke');
+  const emptyEl = document.getElementById('join-code-empty');
+  const activeEl = document.getElementById('join-code-active');
+  const displayEl = document.getElementById('join-code-display');
+  const genBtn = document.getElementById('join-code-generate');
+  const revBtn = document.getElementById('join-code-revoke');
   const isOwner = trip.ownerUid === state.user?.uid;
 
-  const wrap = document.getElementById('share-link-block');
+  const wrap = document.getElementById('join-code-block');
   wrap.style.display = isOwner ? '' : 'none';
   if (!isOwner) return;
 
-  if (trip.shareToken) {
+  if (trip.joinCode) {
     emptyEl.classList.add('hidden');
     activeEl.classList.remove('hidden');
-    inputEl.value = buildInviteUrl(trip.id, trip.shareToken);
-    genBtn.textContent = 'Regenerate link';
+    displayEl.textContent = trip.joinCode;
+    genBtn.textContent = 'Regenerate code';
     revBtn.classList.remove('hidden');
   } else {
     emptyEl.classList.remove('hidden');
     activeEl.classList.add('hidden');
-    genBtn.textContent = 'Generate link';
+    genBtn.textContent = 'Generate code';
     revBtn.classList.add('hidden');
   }
 }
 
-async function handleGenerateShareLink() {
+async function handleGenerateJoinCode() {
   const trip = await getTrip(state.currentTripId);
   if (!trip) return;
   if (trip.ownerUid !== state.user?.uid) {
-    toast('Only the owner can create a link', 'error');
+    toast('Only the owner can create a code', 'error');
     return;
   }
-  const token = randomShareToken();
+  const genBtn = document.getElementById('join-code-generate');
+  const prev = genBtn.textContent;
+  genBtn.disabled = true; genBtn.textContent = 'Generating…';
+
   try {
-    await saveTrip({ ...trip, shareToken: token }, { awaitCloud: true });
-    toast('Link ready to share', 'success');
-    await renderShareLinkUI();
+    // If there's an old code, delete its lookup doc first
+    if (trip.joinCode) {
+      try { await joinCodesDoc(trip.joinCode).delete(); } catch (e) { /* fine */ }
+    }
+    // Try up to 5 codes in case of collision
+    let code, ok = false;
+    for (let i = 0; i < 5; i++) {
+      code = randomCode(trip.name);
+      const existing = await joinCodesDoc(code).get();
+      if (!existing.exists) { ok = true; break; }
+    }
+    if (!ok) throw new Error('Could not generate a unique code');
+
+    // 1) Update trip doc with joinCode (owner rule allows this)
+    await saveTrip({ ...trip, joinCode: code }, { awaitCloud: true });
+
+    // 2) Create lookup doc
+    await joinCodesDoc(code).set({
+      tripId: trip.id,
+      ownerUid: state.user.uid,
+      createdAt: Date.now(),
+    });
+    try { await state.firestore.waitForPendingWrites(); } catch (e) {}
+
+    toast('Code ready to share', 'success');
+    await renderJoinCodeUI();
   } catch (err) {
-    toast('Failed: ' + (err.message || 'unknown'), 'error');
+    console.error(err);
+    toast('Failed: ' + (err.code || err.message || 'unknown'), 'error');
+  } finally {
+    genBtn.disabled = false; genBtn.textContent = prev;
   }
 }
 
-async function handleRevokeShareLink() {
+async function handleRevokeJoinCode() {
   const trip = await getTrip(state.currentTripId);
-  if (!trip) return;
-  if (!confirm('Revoke the current invite link? Anyone with the old link will no longer be able to join.')) return;
+  if (!trip || !trip.joinCode) return;
+  if (!confirm('Revoke this trip code? Nobody will be able to join with it anymore.')) return;
+
   try {
-    await saveTrip({ ...trip, shareToken: null }, { awaitCloud: true });
-    toast('Link revoked', 'success');
-    await renderShareLinkUI();
+    // Delete lookup doc, then clear from trip
+    try { await joinCodesDoc(trip.joinCode).delete(); } catch (e) { /* fine */ }
+    await saveTrip({ ...trip, joinCode: null }, { awaitCloud: true });
+    toast('Code revoked', 'success');
+    await renderJoinCodeUI();
   } catch (err) {
-    toast('Failed: ' + (err.message || 'unknown'), 'error');
+    toast('Failed: ' + (err.code || err.message || 'unknown'), 'error');
   }
 }
 
-async function handleCopyShareLink() {
-  const input = document.getElementById('share-link-input');
-  if (!input || !input.value) return;
+async function handleCopyJoinCode() {
+  const trip = await getTrip(state.currentTripId);
+  if (!trip || !trip.joinCode) return;
+  try {
+    await navigator.clipboard.writeText(trip.joinCode);
+    toast('Code copied', 'success');
+  } catch {
+    // fallback: select the display
+    const el = document.getElementById('join-code-display');
+    const range = document.createRange();
+    range.selectNode(el);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    try { document.execCommand('copy'); toast('Code copied', 'success'); }
+    catch { toast('Long-press the code to copy', ''); }
+  }
+}
+
+async function handleShareJoinCode() {
+  const trip = await getTrip(state.currentTripId);
+  if (!trip || !trip.joinCode) return;
+  const text = `Join my trip "${trip.name}" on Itinerary Planner.\n\nTrip code: ${trip.joinCode}\n\nSign in at ${window.location.origin}${window.location.pathname} and enter the code on your Trips screen.`;
   try {
     if (navigator.share) {
-      await navigator.share({ url: input.value, title: 'Join my trip' });
+      await navigator.share({ title: `Join "${trip.name}"`, text });
     } else {
-      await navigator.clipboard.writeText(input.value);
-      toast('Link copied', 'success');
+      await navigator.clipboard.writeText(text);
+      toast('Invite message copied', 'success');
     }
   } catch (err) {
-    // fallback: select the text
-    input.select();
-    input.setSelectionRange(0, 99999);
-    try {
-      document.execCommand('copy');
-      toast('Link copied', 'success');
-    } catch (e) {
-      toast('Copy failed — long-press to copy', 'error');
-    }
+    if (err.name !== 'AbortError') console.warn(err);
   }
 }
 
-/**
- * Called at boot: if ?join=<id>&t=<token> is in the URL, remember it.
- * After sign-in, we attempt to accept.
- */
-function readPendingInviteFromURL() {
-  const p = new URLSearchParams(window.location.search);
-  const tripId = p.get('join');
-  const token = p.get('t');
-  if (!tripId || !token) return null;
-  return { tripId: Number(tripId), token };
-}
+/* -------- Join by code (invitee side) -------- */
+async function handleJoinByCode(e) {
+  e.preventDefault();
+  if (!state.user) { toast('Sign in first', 'error'); return; }
+  let raw = document.getElementById('join-code-input').value.trim().toUpperCase();
+  if (!raw) return;
 
-async function tryAcceptPendingInvite() {
-  const pending = state._pendingInvite;
-  if (!pending || !state.user || !state.firebaseReady) return;
+  const submitBtn = document.querySelector('#join-form button[type="submit"]');
+  submitBtn.disabled = true; submitBtn.textContent = 'Joining…';
 
   try {
-    // Try to read the trip directly (rules must allow shareToken-based read too)
-    const docSnap = await tripDoc(pending.tripId).get();
-    if (!docSnap.exists) {
-      toast('Invite is invalid or was revoked', 'error');
-      clearPendingInvite();
+    // Try code as-typed, and if not found, try alt variants (with/without dash)
+    const attempts = [raw];
+    if (!raw.includes('-') && raw.length >= 5) {
+      // Insert dash so PREFIX-XXXX lookup works when user typed no dash
+      attempts.push(raw.slice(0, raw.length - 4) + '-' + raw.slice(-4));
+    }
+    if (raw.includes('-')) attempts.push(raw.replace(/-/g, ''));
+
+    let snap = null;
+    for (const c of attempts) {
+      const s = await joinCodesDoc(c).get();
+      if (s.exists) { snap = s; raw = c; break; }
+    }
+    if (!snap) {
+      toast('Code not found — check spelling or ask for a new one', 'error');
       return;
     }
-    const data = docSnap.data();
-    if (!data.shareToken || data.shareToken !== pending.token) {
-      toast('Invite is no longer valid', 'error');
-      clearPendingInvite();
+    const info = snap.data();
+    const tripId = Number(info.tripId);
+
+    // 2) Fetch the trip so we know current collaborators & joinCode field
+    const tripSnap = await tripDoc(tripId).get();
+    if (!tripSnap.exists) {
+      toast('Trip no longer exists', 'error');
       return;
     }
+    const tripData = tripSnap.data();
+    if (tripData.joinCode !== raw) {
+      toast('This code was revoked. Ask the owner for a fresh code.', 'error');
+      return;
+    }
+
     const myEmail = (state.user.email || '').toLowerCase();
     if (!myEmail) { toast('No email on account', 'error'); return; }
 
-    // If already a collaborator or owner — just deep-link
-    if (data.ownerUid === state.user.uid || (data.collaborators || []).map(e => e.toLowerCase()).includes(myEmail)) {
-      clearPendingInvite();
-      state.currentTripId = pending.tripId;
-      switchView('trip-detail');
-      switchTab('schedule');
-      // Wait a bit for sync to populate details
-      setTimeout(() => renderTripDetail(), 300);
+    // 3) If already the owner or collaborator, deep-link
+    if (tripData.ownerUid === state.user.uid
+        || (tripData.collaborators || []).map(e => e.toLowerCase()).includes(myEmail)) {
+      toast(`You're already in "${tripData.name}"`, 'success');
+      // Seed local so it renders even if listener hasn't fired yet
+      await reqP(tx(STORE_TRIPS, 'readwrite').put({ ...tripData, id: tripId, updatedAt: Date.now() }));
+      state.currentTripId = tripId;
+      hideJoinPanel();
+      setTimeout(() => { switchView('trip-detail'); switchTab('schedule'); renderTripDetail(); }, 200);
       return;
     }
 
-    // Show confirm modal
-    document.getElementById('accept-invite-body').textContent =
-      `You've been invited to collaborate on "${data.name || 'a trip'}".`;
-    const dt = document.getElementById('accept-invite-detail');
-    dt.innerHTML = `
-      <div class="stay-card" style="padding:14px">
-        <div class="stay-name" style="font-size:16px">${escapeHtml(data.name || 'Trip')}</div>
-        <div class="stay-address" style="margin-top:4px">${escapeHtml(fmtDateRange(data.startDate, data.days))}</div>
-        <div class="subtle" style="font-size:12px;margin-top:6px">You'll join as an editor with full access.</div>
-      </div>
-    `;
-    document.getElementById('accept-invite-modal').classList.remove('hidden');
-    // Buttons wire once
-    document.getElementById('accept-invite-accept').onclick = async () => {
-      await acceptInvite(pending, data);
-    };
-    document.getElementById('accept-invite-decline').onclick = () => {
-      document.getElementById('accept-invite-modal').classList.add('hidden');
-      clearPendingInvite();
-    };
-  } catch (err) {
-    console.warn('Invite check failed:', err);
-    toast('Could not check invite: ' + (err.code || err.message), 'error');
-  }
-}
-
-async function acceptInvite(pending, tripData) {
-  const myEmail = (state.user.email || '').toLowerCase();
-  try {
-    // Build the new collaborators list
-    const existing = Array.isArray(tripData.collaborators) ? [...tripData.collaborators] : [];
-    if (!existing.map(e => e.toLowerCase()).includes(myEmail)) existing.push(myEmail);
-
-    // Write ONLY these fields — rules require nothing else to change
-    await tripDoc(pending.tripId).update({
-      collaborators: existing,
-      shareToken: tripData.shareToken,  // unchanged, but keeps write safe
+    // 4) Add ourselves as collaborator via a minimal update
+    const newCollabs = Array.isArray(tripData.collaborators) ? [...tripData.collaborators] : [];
+    newCollabs.push(myEmail);
+    await tripDoc(tripId).update({
+      collaborators: newCollabs,
+      joinCode: tripData.joinCode,  // unchanged; rule allows if unchanged
+      ownerUid: tripData.ownerUid,   // unchanged; rule allows
       updatedAt: Date.now(),
     });
+    try { await state.firestore.waitForPendingWrites(); } catch (e) {}
 
-    document.getElementById('accept-invite-modal').classList.add('hidden');
-    clearPendingInvite();
-    toast('Joined trip!', 'success');
-    // Deep-link into the trip after a moment (listener will populate it)
+    toast(`Joined "${tripData.name}"!`, 'success');
+    hideJoinPanel();
+    // Seed the trip into local IDB so the detail view can render immediately,
+    // then let the listener take over for live updates.
+    const seed = {
+      ...tripData,
+      id: tripId,
+      collaborators: newCollabs,
+      _fromCloud: true,
+    };
+    delete seed._fromCloud;  // treat as owned locally
+    await reqP(tx(STORE_TRIPS, 'readwrite').put({ ...seed, updatedAt: Date.now() }));
+    state.currentTripId = tripId;
     setTimeout(() => {
-      state.currentTripId = pending.tripId;
       switchView('trip-detail');
       switchTab('schedule');
       renderTripDetail();
-    }, 400);
+    }, 300);
   } catch (err) {
     console.error(err);
-    toast('Could not join: ' + (err.code || err.message), 'error');
+    const msg = err.code === 'permission-denied'
+      ? "Blocked by Firestore rules — make sure you've published the latest rules from README (Section 5)."
+      : (err.code || err.message || 'unknown error');
+    toast('Join failed: ' + msg, 'error');
+  } finally {
+    submitBtn.disabled = false; submitBtn.textContent = 'Join';
   }
 }
 
-function clearPendingInvite() {
-  state._pendingInvite = null;
-  // Clean URL
-  const url = new URL(window.location.href);
-  url.searchParams.delete('join');
-  url.searchParams.delete('t');
-  window.history.replaceState({}, document.title, url.pathname + (url.search || ''));
+function showJoinPanel() {
+  document.getElementById('join-panel').classList.remove('hidden');
+  setTimeout(() => document.getElementById('join-code-input').focus(), 60);
+}
+function hideJoinPanel() {
+  document.getElementById('join-panel').classList.add('hidden');
+  document.getElementById('join-code-input').value = '';
 }
 
 async function renderWeather() {
@@ -3234,13 +3281,17 @@ function wireEvents() {
   // ===== People / invites =====
   document.getElementById('invite-form').addEventListener('submit', handleInviteCollaborator);
   document.getElementById('people-signin-btn').addEventListener('click', signIn);
-  document.getElementById('share-link-generate').addEventListener('click', handleGenerateShareLink);
-  document.getElementById('share-link-revoke').addEventListener('click', handleRevokeShareLink);
-  document.getElementById('share-link-copy').addEventListener('click', handleCopyShareLink);
-  document.getElementById('accept-invite-modal').addEventListener('click', (e) => {
-    if (e.target.id === 'accept-invite-modal') {
-      document.getElementById('accept-invite-modal').classList.add('hidden');
-    }
+  document.getElementById('join-code-generate').addEventListener('click', handleGenerateJoinCode);
+  document.getElementById('join-code-revoke').addEventListener('click', handleRevokeJoinCode);
+  document.getElementById('join-code-copy').addEventListener('click', handleCopyJoinCode);
+  document.getElementById('join-code-share').addEventListener('click', handleShareJoinCode);
+
+  // Join by code (trips screen)
+  document.getElementById('show-join-btn').addEventListener('click', showJoinPanel);
+  document.getElementById('join-cancel').addEventListener('click', hideJoinPanel);
+  document.getElementById('join-form').addEventListener('submit', handleJoinByCode);
+  document.getElementById('join-code-input').addEventListener('input', (e) => {
+    e.target.value = e.target.value.toUpperCase();
   });
 
   // ===== Activity form attachments =====
@@ -3267,14 +3318,6 @@ async function init() {
     return;
   }
   wireEvents();
-
-  // Detect invite link
-  state._pendingInvite = readPendingInviteFromURL();
-  if (state._pendingInvite) {
-    // Hint to user on login
-    const banner = document.querySelector('#view-login .login-sub');
-    if (banner) banner.textContent = "Sign in to accept your trip invitation.";
-  }
 
   // Show login gate by default
   switchView('login');

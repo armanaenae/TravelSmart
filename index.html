@@ -118,10 +118,23 @@
         <button id="new-trip-btn" class="btn btn-primary">
           <span class="btn-icon">+</span> New Trip
         </button>
+        <button id="show-join-btn" class="btn btn-ghost">
+          <span class="btn-icon">🔑</span> Join by Code
+        </button>
         <label class="btn btn-ghost">
           <span class="btn-icon">↑</span> Import
           <input type="file" id="import-trips-file" accept=".json" hidden />
         </label>
+      </div>
+
+      <div id="join-panel" class="join-panel hidden">
+        <h3>Join a shared trip</h3>
+        <p class="subtle" style="font-size:13px;margin:0 0 12px">Ask the trip owner for their trip code (e.g. <code style="background:var(--surface-2);padding:1px 6px;border-radius:4px;font-family:var(--font-mono)">SUNNY-4X7K</code>).</p>
+        <form id="join-form" class="join-form">
+          <input type="text" id="join-code-input" placeholder="Trip code" autocomplete="off" spellcheck="false" style="text-transform:uppercase" />
+          <button type="submit" class="btn btn-primary">Join</button>
+          <button type="button" id="join-cancel" class="btn btn-ghost">Cancel</button>
+        </form>
       </div>
 
       <div id="trips-grid" class="trips-grid"></div>
@@ -262,21 +275,22 @@
           </form>
           <p class="help subtle" style="margin-top:8px">Enter their Google email. They'll see this trip the next time they sign in with that account. All collaborators have full edit access.</p>
 
-          <div class="section-title" style="margin-top:24px"><h3>Invite Link</h3></div>
-          <div id="share-link-block" class="share-link-block">
-            <div id="share-link-empty" class="subtle" style="font-size:13px;margin-bottom:10px">
-              Generate a link to share directly. Anyone who opens it while signed in will be added as a collaborator.
+          <div class="section-title" style="margin-top:24px"><h3>Trip Code</h3></div>
+          <div id="join-code-block" class="share-link-block">
+            <div id="join-code-empty" class="subtle" style="font-size:13px;margin-bottom:10px">
+              Generate a short code to share. Anyone signed in can enter it on their Trips screen to join.
             </div>
-            <div id="share-link-active" class="hidden">
-              <div class="share-link-row">
-                <input type="text" id="share-link-input" readonly />
-                <button id="share-link-copy" class="btn btn-primary btn-sm" type="button">Copy</button>
+            <div id="join-code-active" class="hidden">
+              <div class="join-code-display" id="join-code-display">·····</div>
+              <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+                <button id="join-code-copy" class="btn btn-primary btn-sm" type="button">📋 Copy code</button>
+                <button id="join-code-share" class="btn btn-ghost btn-sm" type="button">📤 Share</button>
               </div>
-              <p class="help subtle" style="margin-top:6px">Anyone with this link + a Google account can join this trip. Regenerate to invalidate the old link.</p>
+              <p class="help subtle" style="margin-top:8px">Give this code to whoever you want to invite. They enter it on their <strong>Trips</strong> screen. Regenerate any time to invalidate old codes.</p>
             </div>
-            <div style="display:flex;gap:8px;margin-top:8px">
-              <button id="share-link-generate" class="btn btn-ghost btn-sm" type="button">Generate link</button>
-              <button id="share-link-revoke" class="btn btn-danger-ghost btn-sm hidden" type="button">Revoke</button>
+            <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+              <button id="join-code-generate" class="btn btn-ghost btn-sm" type="button">Generate code</button>
+              <button id="join-code-revoke" class="btn btn-danger-ghost btn-sm hidden" type="button">Revoke code</button>
             </div>
           </div>
         </div>
@@ -591,21 +605,6 @@
           <button type="submit" class="btn btn-primary">Save Trip</button>
         </div>
       </form>
-    </div>
-  </div>
-
-  <!-- ============ ACCEPT INVITE MODAL ============ -->
-  <div id="accept-invite-modal" class="modal-overlay hidden" role="dialog" aria-modal="true">
-    <div class="modal">
-      <div class="form">
-        <h2>You've been invited</h2>
-        <p class="form-sub" id="accept-invite-body">Someone shared a trip with you.</p>
-        <div id="accept-invite-detail" style="margin:12px 0"></div>
-        <div class="form-actions">
-          <button type="button" id="accept-invite-decline" class="btn btn-ghost">Decline</button>
-          <button type="button" id="accept-invite-accept" class="btn btn-primary">Accept & open</button>
-        </div>
-      </div>
     </div>
   </div>
 

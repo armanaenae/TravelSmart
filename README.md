@@ -7,7 +7,7 @@ An offline-first Progressive Web App for planning travel itineraries. Sync your 
 - ✈️ Trips + activities with day/time scheduling, cost, travel time
 - 🏨 **Stays tab** — hotels & lodging entered once, auto-populated on every night of the schedule
 - 💡 **Ideas tab** — parking lot for places you might visit; promote to a specific day when ready
-- 👥 **Collaboration** — invite by Google email OR shareable invite link, everyone shares full edit access on that trip
+- 👥 **Collaboration** — invite by Google email OR share a short **Trip Code** anyone signed in can enter. Full edit access for all collaborators.
 - 📎 **File attachments** — upload booking PDFs, receipts, tickets to any activity or stay (5 MB each, stored locally on device)
 - 🗺️ Leaflet map — pin locations, view daily routes, full-trip map
 - 🔍 Location search + auto-geocode (free, no API key)
@@ -73,7 +73,10 @@ The app **works immediately in local-only mode** — no Firebase needed. Do step
      match /databases/{database}/documents {
 
        function isSignedIn() { return request.auth != null; }
-       function myEmail() { return request.auth.token.email.lower(); }
+       function myEmail() {
+         return request.auth != null && request.auth.token.email != null
+                ? request.auth.token.email.lower() : '';
+       }
 
        function isOwner(data) {
          return isSignedIn() && data.ownerUid == request.auth.uid;
@@ -81,47 +84,46 @@ The app **works immediately in local-only mode** — no Firebase needed. Do step
        function isCollaborator(data) {
          return isSignedIn()
              && data.collaborators is list
-             && request.auth.token.email != null
+             && myEmail() != ''
              && data.collaborators.hasAny([myEmail()]);
        }
        function hasAccess(data) {
          return isOwner(data) || isCollaborator(data);
        }
 
-       // For invite links: a signed-in user is joining themselves via a shareToken.
-       // Their write is allowed only if:
-       //   - the trip's shareToken is set AND unchanged in this write
-       //   - the ONLY field they're changing is `collaborators` (+ updatedAt)
-       //   - they're adding exactly THEIR email to the list
-       function isSelfJoinViaToken() {
+       // A signed-in user is joining themselves via a valid joinCode.
+       // Allowed only if:
+       //   - the trip currently has a joinCode
+       //   - joinCode + ownerUid are unchanged in this write
+       //   - the new collaborators list is old + their own email (nothing else)
+       function isSelfJoinViaCode() {
          return isSignedIn()
-           && request.auth.token.email != null
-           && resource.data.shareToken != null
-           && resource.data.shareToken is string
-           && request.resource.data.shareToken == resource.data.shareToken
+           && myEmail() != ''
+           && resource.data.joinCode is string
+           && request.resource.data.joinCode == resource.data.joinCode
            && request.resource.data.ownerUid == resource.data.ownerUid
-           && request.resource.data.name == resource.data.name
            && request.resource.data.collaborators is list
-           && request.resource.data.collaborators.hasAll(resource.data.collaborators)
-           && myEmail() in request.resource.data.collaborators
            && (resource.data.collaborators == null
-               || !(myEmail() in resource.data.collaborators));
+               || !(myEmail() in resource.data.collaborators))
+           && (myEmail() in request.resource.data.collaborators)
+           && request.resource.data.collaborators.hasAll(
+                resource.data.collaborators == null ? [] : resource.data.collaborators
+              );
        }
 
        match /trips/{tripId} {
-         // GET (single-doc read): any signed-in user — needed for invite links to
-         // read the trip's shareToken before joining. The doc still contains only
-         // your own trip data; the shareToken guards write access.
+         // GET (single-doc read): any signed-in user — required so the invitee
+         // can read the joinCode field before joining. Trip IDs are timestamp+random
+         // so unguessable in practice.
          allow get: if isSignedIn();
-         // LIST (queries): only the queries the app makes — filtered by ownerUid
-         // OR by array-contains on your own email.
+         // LIST (queries): filtered per doc by ownerUid or by array-contains email
          allow list: if hasAccess(resource.data);
 
          // Create: must set ownerUid to self
          allow create: if isSignedIn()
                        && request.resource.data.ownerUid == request.auth.uid;
-         // Update: owner OR collaborator (full edit) OR self-join via shareToken
-         allow update: if hasAccess(resource.data) || isSelfJoinViaToken();
+         // Update: owner OR collaborator (full edit) OR self-joining via code
+         allow update: if hasAccess(resource.data) || isSelfJoinViaCode();
          // Delete: owner only
          allow delete: if isOwner(resource.data);
 
@@ -129,6 +131,19 @@ The app **works immediately in local-only mode** — no Firebase needed. Do step
          match /{sub}/{docId} {
            allow read, write: if hasAccess(get(/databases/$(database)/documents/trips/$(tripId)).data);
          }
+       }
+
+       // Join-code lookup collection. Read: any signed-in user.
+       // Write: only the owner of the referenced trip.
+       match /joinCodes/{code} {
+         allow get: if isSignedIn();
+         allow list: if false;
+         allow create: if isSignedIn()
+                       && request.resource.data.ownerUid == request.auth.uid;
+         allow update: if isSignedIn()
+                       && resource.data.ownerUid == request.auth.uid;
+         allow delete: if isSignedIn()
+                       && resource.data.ownerUid == request.auth.uid;
        }
 
        // Legacy path — kept read/write for one-time migration on first sign-in

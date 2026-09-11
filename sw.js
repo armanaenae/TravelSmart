@@ -4,7 +4,7 @@
  * Bumped for new files (map.js, weather.js, firebase-config.js)
  * ============================================================= */
 
-const CACHE_NAME = 'itinerary-v7';
+const CACHE_NAME = 'itinerary-v8';
 const APP_SHELL = [
   './',
   './index.html',
