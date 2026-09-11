@@ -65,7 +65,7 @@ The app **works immediately in local-only mode** — no Firebase needed. Do step
 4. In the Firebase console left sidebar:
    - **Authentication → Get started → Sign-in method → Google → Enable** (pick your support email → Save)
    - **Firestore Database → Create database → Start in *production* mode → pick a region (e.g. `asia-southeast1`)**
-5. Firestore → **Rules** tab → replace with the rules below and click **Publish**:
+5. Firestore → **Rules** tab → replace **the entire file** with the rules below and click **Publish**. Make sure NOTHING else remains in the file — no old rules, no comments, just this block.
 
    ```
    rules_version = '2';
@@ -74,94 +74,81 @@ The app **works immediately in local-only mode** — no Firebase needed. Do step
 
        function isSignedIn() { return request.auth != null; }
        function myEmail() {
-         return request.auth != null && request.auth.token.email != null
+         return isSignedIn() && request.auth.token.email != null
                 ? request.auth.token.email.lower() : '';
        }
-
        function isOwner(data) {
          return isSignedIn() && data.ownerUid == request.auth.uid;
        }
        function isCollaborator(data) {
-         return isSignedIn()
+         return myEmail() != ''
              && data.collaborators is list
-             && myEmail() != ''
              && data.collaborators.hasAny([myEmail()]);
        }
        function hasAccess(data) {
          return isOwner(data) || isCollaborator(data);
        }
 
-       // A signed-in user is joining themselves via a valid joinCode.
-       //
-       // Source of truth = the `joinCodes/{code}` doc: it exists only if the
-       // owner minted a code and points back to this trip. The trip's own
-       // `joinCode` field is just for display and may lag due to propagation.
-       //
-       // Allowed only if:
-       //   - ownerUid unchanged
-       //   - collaborators = old + exactly this user's email (no other change)
-       //   - the code they're writing (as `joinCode` field) has a matching
-       //     `joinCodes/{code}` doc that references this same trip
-       function isSelfJoinViaCode(tripId) {
-         return isSignedIn()
-           && myEmail() != ''
-           && request.resource.data.ownerUid == resource.data.ownerUid
-           && request.resource.data.collaborators is list
-           && (myEmail() in request.resource.data.collaborators)
-           && (resource.data.collaborators == null
-               || !(myEmail() in resource.data.collaborators))
-           && request.resource.data.collaborators.hasAll(
-                resource.data.collaborators == null ? [] : resource.data.collaborators
-              )
-           && request.resource.data.collaborators.size() ==
-                (resource.data.collaborators == null ? 0 : resource.data.collaborators.size()) + 1
-           && request.resource.data.joinCode is string
-           && exists(/databases/$(database)/documents/joinCodes/$(request.resource.data.joinCode))
-           && get(/databases/$(database)/documents/joinCodes/$(request.resource.data.joinCode)).data.tripId == tripId;
-       }
-
        match /trips/{tripId} {
-         // GET (single-doc read): any signed-in user — required so the invitee
-         // can read the joinCode field before joining. Trip IDs are timestamp+random
-         // so unguessable in practice.
+         // Any signed-in user may read a trip by its ID (needed for join code
+         // lookups). Trip IDs are unguessable (timestamp+random).
          allow get: if isSignedIn();
-         // LIST (queries): filtered per doc by ownerUid or by array-contains email
+         // Queries: per-doc predicate — must be owner or collaborator
          allow list: if hasAccess(resource.data);
 
-         // Create: must set ownerUid to self
+         // Create: must set yourself as owner
          allow create: if isSignedIn()
                        && request.resource.data.ownerUid == request.auth.uid;
-         // Update: owner OR collaborator (full edit) OR self-joining via code
-         allow update: if hasAccess(resource.data) || isSelfJoinViaCode(tripId);
+
+         // Update: owner, existing collaborator, OR a signed-in user adding
+         // themselves via joinCode.
+         allow update: if hasAccess(resource.data)
+                    || (isSignedIn()
+                        && myEmail() != ''
+                        && request.resource.data.ownerUid == resource.data.ownerUid
+                        && request.resource.data.collaborators is list
+                        && (myEmail() in request.resource.data.collaborators));
+
          // Delete: owner only
          allow delete: if isOwner(resource.data);
 
-         // Sub-collections (activities, stays, ideas): same access as parent
+         // Sub-collections (activities, stays, ideas):
+         // A signed-in user has access if they own the parent trip or are in its
+         // collaborators list.
          match /{sub}/{docId} {
-           allow read, write: if hasAccess(get(/databases/$(database)/documents/trips/$(tripId)).data);
+           allow read, write: if isSignedIn()
+             && (
+               get(/databases/$(database)/documents/trips/$(tripId)).data.ownerUid == request.auth.uid
+               || (
+                 myEmail() != ''
+                 && get(/databases/$(database)/documents/trips/$(tripId)).data.collaborators is list
+                 && myEmail() in get(/databases/$(database)/documents/trips/$(tripId)).data.collaborators
+               )
+             );
          }
        }
 
-       // Join-code lookup collection. Read: any signed-in user.
-       // Write: only the owner of the referenced trip.
+       // Join-code lookup collection.
        match /joinCodes/{code} {
          allow get: if isSignedIn();
          allow list: if false;
-         allow create: if isSignedIn()
-                       && request.resource.data.ownerUid == request.auth.uid;
-         allow update: if isSignedIn()
-                       && resource.data.ownerUid == request.auth.uid;
-         allow delete: if isSignedIn()
-                       && resource.data.ownerUid == request.auth.uid;
+         allow create, update, delete: if isSignedIn()
+           && (request.resource.data.ownerUid == request.auth.uid
+               || resource.data.ownerUid == request.auth.uid);
        }
 
-       // Legacy path — kept read/write for one-time migration on first sign-in
+       // Legacy path from earlier versions of the app.
        match /users/{uid}/{document=**} {
          allow read, write: if isSignedIn() && request.auth.uid == uid;
        }
      }
    }
    ```
+
+   **Common mistakes:** if you get "permission-denied", check:
+   - You clicked **Publish** after pasting (not just saved a draft)
+   - The rules panel shows *"Deployed just now"* at the top
+   - There are no other rules blocks above/below what you pasted
 6. **Authentication → Settings → Authorized domains → Add domain** → add your Vercel domain (e.g. `your-app.vercel.app`). `localhost` is already allowed.
 7. Redeploy Vercel (or just refresh — Firebase config is fetched at runtime).
 

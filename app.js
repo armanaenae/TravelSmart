@@ -3251,13 +3251,75 @@ async function forceRefreshFromCloudQuiet() {
   }
 }
 
+async function runRulesHealthCheck() {
+  if (!state.user || !state.firebaseReady) {
+    toast('Sign in first', 'error');
+    return;
+  }
+  const results = [];
+  const email = (state.user.email || '').toLowerCase();
+
+  const check = async (label, fn) => {
+    try {
+      await fn();
+      results.push(`✅ ${label}`);
+    } catch (e) {
+      results.push(`❌ ${label} — ${e.code || e.message}`);
+    }
+  };
+
+  await check('Query owned trips (list rule)', async () => {
+    await tripsCol().where('ownerUid', '==', state.user.uid).limit(1).get({ source: 'server' });
+  });
+
+  if (email) {
+    await check(`Query shared trips (list rule w/ array-contains "${email}")`, async () => {
+      await tripsCol().where('collaborators', 'array-contains', email).limit(1).get({ source: 'server' });
+    });
+  } else {
+    results.push('⚠️ No email on your account — collab queries impossible');
+  }
+
+  // Try reading an existing trip if we have one
+  const trips = await getAllTrips();
+  if (trips.length) {
+    const t = trips[0];
+    await check(`Read trip "${t.name}" by ID (get rule)`, async () => {
+      await tripDoc(t.id).get({ source: 'server' });
+    });
+    await check(`Read trip "${t.name}" activities (subcol rule)`, async () => {
+      await actsCol(t.id).limit(1).get({ source: 'server' });
+    });
+    await check(`Read trip "${t.name}" stays (subcol rule)`, async () => {
+      await staysCol(t.id).limit(1).get({ source: 'server' });
+    });
+  }
+
+  await check('Read joinCodes lookup collection', async () => {
+    // Try reading a bogus code — should fail-not-found, not permission-denied
+    const s = await state.firestore.collection('joinCodes').doc('__healthcheck__').get({ source: 'server' });
+    // getting a non-existent doc returns exists=false without error
+    if (!s.exists) return;
+  });
+
+  const summary = results.join('\n');
+  const panel = document.getElementById('sync-debug');
+  const content = document.getElementById('sync-debug-content');
+  content.textContent = 'Firestore Rules Health Check\n\n' + summary
+    + '\n\nIf any ❌ appears above, your Firestore rules need updating.\n'
+    + 'Go to Firebase Console → Firestore → Rules and publish the block from README.md step 5.';
+  panel.classList.remove('hidden');
+}
+
 async function forceRefreshFromCloud() {
   if (!state.user || !state.firebaseReady) {
     toast('Sign in first', 'error');
     return;
   }
   toast('Refreshing from cloud…');
+  let step = 'starting';
   try {
+    step = 'clearing local cache';
     await reqP(tx(STORE_TRIPS, 'readwrite').clear());
     await reqP(tx(STORE_ACTIVITIES, 'readwrite').clear());
     await reqP(tx(STORE_STAYS, 'readwrite').clear());
@@ -3265,10 +3327,25 @@ async function forceRefreshFromCloud() {
     stopCloudSync();
 
     const email = (state.user.email || '').toLowerCase();
-    const [ownedSnap, collabSnap] = await Promise.all([
-      tripsCol().where('ownerUid', '==', state.user.uid).get({ source: 'server' }),
-      email ? tripsCol().where('collaborators', 'array-contains', email).get({ source: 'server' }) : Promise.resolve({ docs: [] }),
-    ]);
+
+    step = 'querying owned trips';
+    let ownedSnap;
+    try {
+      ownedSnap = await tripsCol().where('ownerUid', '==', state.user.uid).get({ source: 'server' });
+    } catch (e) {
+      throw new Error(`Owned-trips query denied. Fix: publish the "list" rule for trips. (${e.code || e.message})`);
+    }
+
+    step = 'querying shared trips';
+    let collabSnap = { docs: [] };
+    if (email) {
+      try {
+        collabSnap = await tripsCol().where('collaborators', 'array-contains', email).get({ source: 'server' });
+      } catch (e) {
+        throw new Error(`Shared-trips query denied. Rules must allow list where collaborators array-contains your email. (${e.code || e.message})`);
+      }
+    }
+
     const seen = new Set();
     const allDocs = [];
     [...ownedSnap.docs, ...collabSnap.docs].forEach(d => {
@@ -3281,33 +3358,40 @@ async function forceRefreshFromCloud() {
       data.id = Number(doc.id);
       await reqP(tx(STORE_TRIPS, 'readwrite').put(data));
 
-      const [aSnap, sSnap, iSnap] = await Promise.all([
-        actsCol(data.id).get({ source: 'server' }),
-        staysCol(data.id).get({ source: 'server' }),
-        ideasCol(data.id).get({ source: 'server' }),
-      ]);
-      for (const d of aSnap.docs) {
-        const x = d.data(); x.id = Number(d.id); x.tripId = data.id;
-        await reqP(tx(STORE_ACTIVITIES, 'readwrite').put(x));
-      }
-      for (const d of sSnap.docs) {
-        const x = d.data(); x.id = Number(d.id); x.tripId = data.id;
-        await reqP(tx(STORE_STAYS, 'readwrite').put(x));
-      }
-      for (const d of iSnap.docs) {
-        const x = d.data(); x.id = Number(d.id); x.tripId = data.id;
-        await reqP(tx(STORE_IDEAS, 'readwrite').put(x));
+      step = `reading sub-collections for trip "${data.name}"`;
+      try {
+        const [aSnap, sSnap, iSnap] = await Promise.all([
+          actsCol(data.id).get({ source: 'server' }),
+          staysCol(data.id).get({ source: 'server' }),
+          ideasCol(data.id).get({ source: 'server' }),
+        ]);
+        for (const d of aSnap.docs) {
+          const x = d.data(); x.id = Number(d.id); x.tripId = data.id;
+          await reqP(tx(STORE_ACTIVITIES, 'readwrite').put(x));
+        }
+        for (const d of sSnap.docs) {
+          const x = d.data(); x.id = Number(d.id); x.tripId = data.id;
+          await reqP(tx(STORE_STAYS, 'readwrite').put(x));
+        }
+        for (const d of iSnap.docs) {
+          const x = d.data(); x.id = Number(d.id); x.tripId = data.id;
+          await reqP(tx(STORE_IDEAS, 'readwrite').put(x));
+        }
+      } catch (e) {
+        console.warn(`[refresh] Sub-collections denied for trip ${data.id}:`, e);
+        // Don't fail the whole refresh — just skip children for this trip
       }
     }
 
+    step = 'restarting listeners';
     startCloudSync();
     await renderTripsList();
     if (state.currentTripId) await renderTripDetail();
-    toast(`Loaded ${allDocs.length} trips from cloud`, 'success');
+    toast(`Loaded ${allDocs.length} trip${allDocs.length === 1 ? '' : 's'} from cloud`, 'success');
     await showSyncDebug();
   } catch (err) {
-    console.error(err);
-    toast('Refresh failed: ' + (err.code || err.message), 'error');
+    console.error('[refresh] failed during', step, err);
+    toast(`Refresh failed while ${step}: ${err.message || err.code || 'unknown'}`, 'error');
   }
 }
 
@@ -3592,6 +3676,7 @@ function wireEvents() {
   document.getElementById('force-sync-btn').addEventListener('click', forceRefreshFromCloud);
   document.getElementById('sync-debug-close').addEventListener('click', hideSyncDebug);
   document.getElementById('sync-debug-refresh').addEventListener('click', forceRefreshFromCloud);
+  document.getElementById('rules-check-btn').addEventListener('click', runRulesHealthCheck);
 
   // Header refresh button — visible whenever signed in
   document.getElementById('refresh-btn').addEventListener('click', async () => {
