@@ -8,10 +8,15 @@
  * CONSTANTS
  * ============================================================= */
 const DB_NAME = 'itinerary-planner';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 const STORE_TRIPS = 'trips';
 const STORE_ACTIVITIES = 'activities';
+const STORE_STAYS = 'stays';
+const STORE_IDEAS = 'ideas';
+const STORE_ATTACHMENTS = 'attachments';
 const STORE_META = 'meta';
+
+const MAX_ATTACHMENT_SIZE = 5 * 1024 * 1024; // 5 MB
 
 const CATEGORY_EMOJI = {
   food: '🍽️', sightseeing: '🏛️', adventure: '🎢',
@@ -45,6 +50,14 @@ const state = {
   pickedTripCoord: null,
   pickedTransportFromCoord: null,
   pickedTransportToCoord: null,
+  pickedStayCoord: null,
+  pickedIdeaCoord: null,
+  editingStayId: null,
+  editingIdeaId: null,
+  schedulingIdeaId: null,
+  pendingAttachments: [], // buffered until save
+  unsubStays: null,
+  unsubIdeas: null,
 };
 
 /* =============================================================
@@ -61,6 +74,21 @@ function openDB() {
       if (!db.objectStoreNames.contains(STORE_ACTIVITIES)) {
         const s = db.createObjectStore(STORE_ACTIVITIES, { keyPath: 'id' });
         s.createIndex('tripId', 'tripId', { unique: false });
+      }
+      if (!db.objectStoreNames.contains(STORE_STAYS)) {
+        const s = db.createObjectStore(STORE_STAYS, { keyPath: 'id' });
+        s.createIndex('tripId', 'tripId', { unique: false });
+      }
+      if (!db.objectStoreNames.contains(STORE_IDEAS)) {
+        const s = db.createObjectStore(STORE_IDEAS, { keyPath: 'id' });
+        s.createIndex('tripId', 'tripId', { unique: false });
+      }
+      if (!db.objectStoreNames.contains(STORE_ATTACHMENTS)) {
+        // Attachments are stored as blobs locally; keyed by id.
+        // parent = { kind: 'activity'|'stay', id: number }, tripId included for scoping
+        const s = db.createObjectStore(STORE_ATTACHMENTS, { keyPath: 'id' });
+        s.createIndex('tripId', 'tripId', { unique: false });
+        s.createIndex('parentKey', 'parentKey', { unique: false });
       }
       if (!db.objectStoreNames.contains(STORE_META)) {
         db.createObjectStore(STORE_META, { keyPath: 'key' });
@@ -92,8 +120,23 @@ async function saveTrip(trip) {
 async function deleteTripDB(id) {
   await reqP(tx(STORE_TRIPS, 'readwrite').delete(id));
   const acts = await getActivitiesByTrip(id);
-  const store = tx(STORE_ACTIVITIES, 'readwrite');
-  await Promise.all(acts.map(a => reqP(store.delete(a.id))));
+  const actStore = tx(STORE_ACTIVITIES, 'readwrite');
+  await Promise.all(acts.map(a => reqP(actStore.delete(a.id))));
+  const stays = await getStaysByTrip(id);
+  const stayStore = tx(STORE_STAYS, 'readwrite');
+  await Promise.all(stays.map(s => reqP(stayStore.delete(s.id))));
+  const ideas = await getIdeasByTrip(id);
+  const ideaStore = tx(STORE_IDEAS, 'readwrite');
+  await Promise.all(ideas.map(i => reqP(ideaStore.delete(i.id))));
+  // Attachments scoped by tripId
+  const attStore = tx(STORE_ATTACHMENTS);
+  const atts = await new Promise((res, rej) => {
+    const r = attStore.index('tripId').getAll(id);
+    r.onsuccess = () => res(r.result || []);
+    r.onerror = () => rej(r.error);
+  });
+  const attRW = tx(STORE_ATTACHMENTS, 'readwrite');
+  await Promise.all(atts.map(a => reqP(attRW.delete(a.id))));
   if (state.user) deleteTripCloud(id);
 }
 
@@ -117,7 +160,82 @@ async function saveActivity(a) {
 async function deleteActivityDB(id) {
   const a = await getActivity(id);
   await reqP(tx(STORE_ACTIVITIES, 'readwrite').delete(id));
+  // Cascade: remove attachments
+  await deleteAttachmentsForParent(a && a.tripId, 'activity', id);
   if (state.user && a) deleteActivityCloud(a.tripId, id);
+}
+
+/* --- Stays --- */
+async function getStaysByTrip(tripId) {
+  return new Promise((resolve, reject) => {
+    const store = tx(STORE_STAYS);
+    const req = store.index('tripId').getAll(tripId);
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function getStay(id) { return reqP(tx(STORE_STAYS).get(id)); }
+async function saveStay(s) {
+  s.updatedAt = Date.now();
+  await reqP(tx(STORE_STAYS, 'readwrite').put(s));
+  if (state.user && !s._fromCloud) syncStayUp(s);
+  return s;
+}
+async function deleteStayDB(id) {
+  const s = await getStay(id);
+  await reqP(tx(STORE_STAYS, 'readwrite').delete(id));
+  await deleteAttachmentsForParent(s && s.tripId, 'stay', id);
+  if (state.user && s) deleteStayCloud(s.tripId, id);
+}
+
+/* --- Ideas --- */
+async function getIdeasByTrip(tripId) {
+  return new Promise((resolve, reject) => {
+    const store = tx(STORE_IDEAS);
+    const req = store.index('tripId').getAll(tripId);
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function getIdea(id) { return reqP(tx(STORE_IDEAS).get(id)); }
+async function saveIdea(i) {
+  i.updatedAt = Date.now();
+  await reqP(tx(STORE_IDEAS, 'readwrite').put(i));
+  if (state.user && !i._fromCloud) syncIdeaUp(i);
+  return i;
+}
+async function deleteIdeaDB(id) {
+  const i = await getIdea(id);
+  await reqP(tx(STORE_IDEAS, 'readwrite').delete(id));
+  if (state.user && i) deleteIdeaCloud(i.tripId, id);
+}
+
+/* --- Attachments --- */
+function parentKey(kind, id) { return kind + ':' + id; }
+
+async function getAttachmentsForParent(kind, parentId) {
+  return new Promise((resolve, reject) => {
+    const store = tx(STORE_ATTACHMENTS);
+    const req = store.index('parentKey').getAll(parentKey(kind, parentId));
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function getAttachment(id) { return reqP(tx(STORE_ATTACHMENTS).get(id)); }
+async function saveAttachment(att) {
+  att.updatedAt = Date.now();
+  await reqP(tx(STORE_ATTACHMENTS, 'readwrite').put(att));
+  // Attachments are LOCAL-ONLY (Firestore has 1MB doc limit and Storage requires
+  // billing on some tiers). They stay on the device that added them.
+  return att;
+}
+async function deleteAttachment(id) {
+  return reqP(tx(STORE_ATTACHMENTS, 'readwrite').delete(id));
+}
+async function deleteAttachmentsForParent(tripId, kind, parentId) {
+  const list = await getAttachmentsForParent(kind, parentId);
+  const store = tx(STORE_ATTACHMENTS, 'readwrite');
+  await Promise.all(list.map(a => reqP(store.delete(a.id))));
 }
 
 /* =============================================================
@@ -234,32 +352,37 @@ async function signOut() {
 
 /* =============================================================
  * CLOUD SYNC (Firestore)
- * Doc layout:
- *   users/{uid}/trips/{tripId}
- *   users/{uid}/trips/{tripId}/activities/{activityId}
+ * Doc layout (root-level so collaborators can access):
+ *   trips/{tripId}                            — has ownerUid + collaborators[] (lowercased emails)
+ *   trips/{tripId}/activities/{activityId}
+ *   trips/{tripId}/stays/{stayId}
+ *   trips/{tripId}/ideas/{ideaId}
  * ============================================================= */
-function userTripsCol() {
-  return state.firestore.collection('users').doc(state.user.uid).collection('trips');
-}
-function userActsCol(tripId) {
-  return userTripsCol().doc(String(tripId)).collection('activities');
-}
+function tripsCol() { return state.firestore.collection('trips'); }
+function tripDoc(tripId) { return tripsCol().doc(String(tripId)); }
+function actsCol(tripId) { return tripDoc(tripId).collection('activities'); }
+function staysCol(tripId) { return tripDoc(tripId).collection('stays'); }
+function ideasCol(tripId) { return tripDoc(tripId).collection('ideas'); }
 
 function startCloudSync() {
   if (!state.user) return;
   stopCloudSync();
 
-  // Listen to trips
-  state.unsubTrips = userTripsCol().onSnapshot(async snap => {
-    const changes = snap.docChanges();
-    for (const ch of changes) {
+  const email = (state.user.email || '').toLowerCase();
+
+  // Two queries: trips I own, and trips I collaborate on.
+  // Merged via onSnapshot listeners for each.
+  const ownedQ = tripsCol().where('ownerUid', '==', state.user.uid);
+  const collabQ = tripsCol().where('collaborators', 'array-contains', email);
+
+  const handleSnap = async (snap) => {
+    for (const ch of snap.docChanges()) {
       const data = ch.doc.data();
       data.id = Number(ch.doc.id);
       if (ch.type === 'removed') {
         const local = await getTrip(data.id);
         if (local) await reqP(tx(STORE_TRIPS, 'readwrite').delete(data.id));
       } else {
-        // Apply if newer than local
         const local = await getTrip(data.id);
         if (!local || (data.updatedAt || 0) >= (local.updatedAt || 0)) {
           data._fromCloud = true;
@@ -270,51 +393,107 @@ function startCloudSync() {
     }
     renderTripsList();
     if (state.currentTripId) renderTripDetail();
-    // Kick off per-trip activity listeners
-    subscribeToAllTripActivities();
-  }, err => {
-    console.warn('Trip sync error:', err);
-  });
+    subscribeToAllTripChildren();
+  };
+
+  const unsubOwned = ownedQ.onSnapshot(handleSnap, err => console.warn('Owned trips sync error:', err));
+  const unsubCollab = collabQ.onSnapshot(handleSnap, err => console.warn('Collab trips sync error:', err));
+  state.unsubTrips = () => { unsubOwned(); unsubCollab(); };
 }
+
 function stopCloudSync() {
   if (state.unsubTrips) { state.unsubTrips(); state.unsubTrips = null; }
-  if (state.unsubActs) {
-    Object.values(state.unsubActs).forEach(fn => fn && fn());
-    state.unsubActs = null;
-  }
+  const unsubAll = (map) => {
+    if (!map) return;
+    Object.values(map).forEach(fn => fn && fn());
+  };
+  unsubAll(state.unsubActs); state.unsubActs = null;
+  unsubAll(state.unsubStays); state.unsubStays = null;
+  unsubAll(state.unsubIdeas); state.unsubIdeas = null;
 }
-async function subscribeToAllTripActivities() {
+
+async function subscribeToAllTripChildren() {
   if (!state.user) return;
   if (!state.unsubActs) state.unsubActs = {};
+  if (!state.unsubStays) state.unsubStays = {};
+  if (!state.unsubIdeas) state.unsubIdeas = {};
+
   const trips = await getAllTrips();
   const wanted = new Set(trips.map(t => String(t.id)));
+
   // Unsubscribe stale
-  Object.keys(state.unsubActs).forEach(id => {
-    if (!wanted.has(id)) { state.unsubActs[id](); delete state.unsubActs[id]; }
+  ['unsubActs', 'unsubStays', 'unsubIdeas'].forEach(k => {
+    Object.keys(state[k]).forEach(id => {
+      if (!wanted.has(id)) { state[k][id](); delete state[k][id]; }
+    });
   });
-  // Subscribe new
+
   for (const t of trips) {
     const key = String(t.id);
-    if (state.unsubActs[key]) continue;
-    state.unsubActs[key] = userActsCol(t.id).onSnapshot(async snap => {
-      for (const ch of snap.docChanges()) {
-        const data = ch.doc.data();
-        data.id = Number(ch.doc.id);
-        data.tripId = t.id;
-        if (ch.type === 'removed') {
-          await reqP(tx(STORE_ACTIVITIES, 'readwrite').delete(data.id));
-        } else {
-          const local = await getActivity(data.id);
-          if (!local || (data.updatedAt || 0) >= (local.updatedAt || 0)) {
-            data._fromCloud = true;
-            await reqP(tx(STORE_ACTIVITIES, 'readwrite').put(data));
-            delete data._fromCloud;
+    // Activities
+    if (!state.unsubActs[key]) {
+      state.unsubActs[key] = actsCol(t.id).onSnapshot(async snap => {
+        for (const ch of snap.docChanges()) {
+          const data = ch.doc.data();
+          data.id = Number(ch.doc.id);
+          data.tripId = t.id;
+          if (ch.type === 'removed') {
+            await reqP(tx(STORE_ACTIVITIES, 'readwrite').delete(data.id));
+          } else {
+            const local = await getActivity(data.id);
+            if (!local || (data.updatedAt || 0) >= (local.updatedAt || 0)) {
+              data._fromCloud = true;
+              await reqP(tx(STORE_ACTIVITIES, 'readwrite').put(data));
+              delete data._fromCloud;
+            }
           }
         }
-      }
-      if (state.currentTripId === t.id) renderTripDetail();
-      renderTripsList();
-    });
+        if (state.currentTripId === t.id) renderTripDetail();
+        renderTripsList();
+      }, err => console.warn('Activity sync err:', err));
+    }
+    // Stays
+    if (!state.unsubStays[key]) {
+      state.unsubStays[key] = staysCol(t.id).onSnapshot(async snap => {
+        for (const ch of snap.docChanges()) {
+          const data = ch.doc.data();
+          data.id = Number(ch.doc.id);
+          data.tripId = t.id;
+          if (ch.type === 'removed') {
+            await reqP(tx(STORE_STAYS, 'readwrite').delete(data.id));
+          } else {
+            const local = await getStay(data.id);
+            if (!local || (data.updatedAt || 0) >= (local.updatedAt || 0)) {
+              data._fromCloud = true;
+              await reqP(tx(STORE_STAYS, 'readwrite').put(data));
+              delete data._fromCloud;
+            }
+          }
+        }
+        if (state.currentTripId === t.id) renderTripDetail();
+      }, err => console.warn('Stay sync err:', err));
+    }
+    // Ideas
+    if (!state.unsubIdeas[key]) {
+      state.unsubIdeas[key] = ideasCol(t.id).onSnapshot(async snap => {
+        for (const ch of snap.docChanges()) {
+          const data = ch.doc.data();
+          data.id = Number(ch.doc.id);
+          data.tripId = t.id;
+          if (ch.type === 'removed') {
+            await reqP(tx(STORE_IDEAS, 'readwrite').delete(data.id));
+          } else {
+            const local = await getIdea(data.id);
+            if (!local || (data.updatedAt || 0) >= (local.updatedAt || 0)) {
+              data._fromCloud = true;
+              await reqP(tx(STORE_IDEAS, 'readwrite').put(data));
+              delete data._fromCloud;
+            }
+          }
+        }
+        if (state.currentTripId === t.id && state.currentTab === 'ideas') renderIdeasTab();
+      }, err => console.warn('Idea sync err:', err));
+    }
   }
 }
 
@@ -323,18 +502,23 @@ async function syncTripUp(trip) {
   try {
     const clean = { ...trip };
     delete clean._fromCloud;
-    clean.ownerUid = state.user.uid;
-    await userTripsCol().doc(String(trip.id)).set(clean, { merge: true });
+    if (!clean.ownerUid) clean.ownerUid = state.user.uid;
+    if (!Array.isArray(clean.collaborators)) clean.collaborators = [];
+    await tripDoc(trip.id).set(clean, { merge: true });
   } catch (err) { console.warn('Trip upload failed:', err); }
 }
 async function deleteTripCloud(id) {
   if (!state.user) return;
   try {
-    // Delete activities first
-    const snap = await userActsCol(id).get();
+    // Delete children first
+    const [acts, stays, ideas] = await Promise.all([
+      actsCol(id).get(), staysCol(id).get(), ideasCol(id).get(),
+    ]);
     const batch = state.firestore.batch();
-    snap.forEach(d => batch.delete(d.ref));
-    batch.delete(userTripsCol().doc(String(id)));
+    acts.forEach(d => batch.delete(d.ref));
+    stays.forEach(d => batch.delete(d.ref));
+    ideas.forEach(d => batch.delete(d.ref));
+    batch.delete(tripDoc(id));
     await batch.commit();
   } catch (err) { console.warn('Trip cloud delete failed:', err); }
 }
@@ -343,13 +527,37 @@ async function syncActivityUp(a) {
   try {
     const clean = { ...a };
     delete clean._fromCloud;
-    await userActsCol(a.tripId).doc(String(a.id)).set(clean, { merge: true });
+    await actsCol(a.tripId).doc(String(a.id)).set(clean, { merge: true });
   } catch (err) { console.warn('Activity upload failed:', err); }
 }
 async function deleteActivityCloud(tripId, actId) {
   if (!state.user) return;
-  try { await userActsCol(tripId).doc(String(actId)).delete(); }
+  try { await actsCol(tripId).doc(String(actId)).delete(); }
   catch (err) { console.warn('Activity cloud delete failed:', err); }
+}
+async function syncStayUp(s) {
+  if (!state.user) return;
+  try {
+    const clean = { ...s }; delete clean._fromCloud;
+    await staysCol(s.tripId).doc(String(s.id)).set(clean, { merge: true });
+  } catch (err) { console.warn('Stay upload failed:', err); }
+}
+async function deleteStayCloud(tripId, stayId) {
+  if (!state.user) return;
+  try { await staysCol(tripId).doc(String(stayId)).delete(); }
+  catch (err) { console.warn('Stay cloud delete failed:', err); }
+}
+async function syncIdeaUp(i) {
+  if (!state.user) return;
+  try {
+    const clean = { ...i }; delete clean._fromCloud;
+    await ideasCol(i.tripId).doc(String(i.id)).set(clean, { merge: true });
+  } catch (err) { console.warn('Idea upload failed:', err); }
+}
+async function deleteIdeaCloud(tripId, ideaId) {
+  if (!state.user) return;
+  try { await ideasCol(tripId).doc(String(ideaId)).delete(); }
+  catch (err) { console.warn('Idea cloud delete failed:', err); }
 }
 
 async function migrateLocalToCloud() {
@@ -358,11 +566,46 @@ async function migrateLocalToCloud() {
   for (const t of trips) {
     if (!t.ownerUid) {
       t.ownerUid = state.user.uid;
+      if (!Array.isArray(t.collaborators)) t.collaborators = [];
       await reqP(tx(STORE_TRIPS, 'readwrite').put(t));
       await syncTripUp(t);
-      const acts = await getActivitiesByTrip(t.id);
+      const [acts, stays, ideas] = await Promise.all([
+        getActivitiesByTrip(t.id), getStaysByTrip(t.id), getIdeasByTrip(t.id),
+      ]);
       for (const a of acts) await syncActivityUp(a);
+      for (const s of stays) await syncStayUp(s);
+      for (const i of ideas) await syncIdeaUp(i);
     }
+  }
+  // Also migrate legacy users/{uid}/trips → root trips (best-effort, one-time)
+  await migrateLegacyPath();
+}
+
+async function migrateLegacyPath() {
+  try {
+    const legacyCol = state.firestore.collection('users').doc(state.user.uid).collection('trips');
+    const snap = await legacyCol.get();
+    if (snap.empty) return;
+    for (const doc of snap.docs) {
+      const data = doc.data();
+      data.id = Number(doc.id);
+      data.ownerUid = state.user.uid;
+      if (!Array.isArray(data.collaborators)) data.collaborators = [];
+      data.updatedAt = Date.now();
+      // Only migrate if root doc doesn't already exist
+      const rootExists = await tripDoc(data.id).get();
+      if (rootExists.exists) continue;
+      await tripDoc(data.id).set(data, { merge: true });
+      // Migrate legacy activities
+      const legacyActs = await legacyCol.doc(doc.id).collection('activities').get();
+      for (const ad of legacyActs.docs) {
+        const av = ad.data(); av.id = Number(ad.id); av.tripId = data.id;
+        await actsCol(data.id).doc(ad.id).set(av, { merge: true });
+      }
+    }
+    if (!snap.empty) toast('Migrated cloud data to new collaborative format', 'success');
+  } catch (err) {
+    console.warn('Legacy migration skipped:', err);
   }
 }
 
@@ -472,9 +715,14 @@ function switchView(view) {
 function switchTab(tab) {
   state.currentTab = tab;
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
-  document.getElementById('tab-schedule').classList.toggle('hidden', tab !== 'schedule');
-  document.getElementById('tab-map').classList.toggle('hidden', tab !== 'map');
+  ['schedule', 'stays', 'ideas', 'map', 'people'].forEach(t => {
+    const el = document.getElementById('tab-' + t);
+    if (el) el.classList.toggle('hidden', t !== tab);
+  });
   if (tab === 'map') renderTripMap();
+  if (tab === 'stays') renderStaysTab();
+  if (tab === 'ideas') renderIdeasTab();
+  if (tab === 'people') renderPeopleTab();
 }
 
 /* =============================================================
@@ -537,6 +785,10 @@ async function renderTripDetail() {
     return;
   }
   const acts = await getActivitiesByTrip(trip.id);
+  // Hydrate attachments so they render inline
+  await Promise.all(acts.map(async a => {
+    a._attachments = await getAttachmentsForParent('activity', a.id);
+  }));
   const totalCost = acts.reduce((s, a) => s + (Number(a.cost) || 0), 0);
 
   document.getElementById('trip-detail-name').textContent = trip.name;
@@ -571,11 +823,14 @@ async function renderTripDetail() {
   document.getElementById('stat-cost-sub').textContent = trip.days
     ? `${fmtMoney(totalCost / trip.days)}/day avg` : '';
 
-  renderSchedule(trip, acts);
+  await renderSchedule(trip, acts);
   if (state.currentTab === 'map') renderTripMap();
+  if (state.currentTab === 'stays') renderStaysTab();
+  if (state.currentTab === 'ideas') renderIdeasTab();
+  if (state.currentTab === 'people') renderPeopleTab();
 }
 
-function renderSchedule(trip, activities) {
+async function renderSchedule(trip, activities) {
   const container = document.getElementById('schedule');
 
   activities.sort((a, b) => {
@@ -583,49 +838,60 @@ function renderSchedule(trip, activities) {
     return (a.time || '').localeCompare(b.time || '');
   });
 
+  const stays = await getStaysByTrip(trip.id);
+
   const byDay = {};
   for (let d = 1; d <= trip.days; d++) byDay[d] = [];
   activities.forEach(a => {
     if (a.day >= 1 && a.day <= trip.days) byDay[a.day].push(a);
   });
 
-  const html = Object.keys(byDay).map(d => {
+  // Pre-compute stay bindings per day
+  const stayByDay = {}; // day -> [{ stay, kind: 'checkin'|'night'|'checkout' }]
+  stays.forEach(s => {
+    const cin = Math.max(1, s.checkInDay || 1);
+    const nights = Math.max(1, s.nights || 1);
+    for (let d = cin; d <= Math.min(trip.days, cin + nights); d++) {
+      if (!stayByDay[d]) stayByDay[d] = [];
+      let kind = 'night';
+      if (d === cin) kind = 'checkin';
+      else if (d === cin + nights) kind = 'checkout';
+      stayByDay[d].push({ stay: s, kind });
+    }
+  });
+
+  const parts = [];
+
+  for (const d of Object.keys(byDay)) {
     const dayNum = Number(d);
     const acts = byDay[d];
     const dayCost = acts.reduce((s, a) => s + (Number(a.cost) || 0), 0);
     const dateLabel = trip.startDate ? addDaysLabel(trip.startDate, dayNum - 1) : '';
     const hasCoords = dayHasCoords(activities, dayNum);
-
-    // Split accommodations from other activities
-    const stays = acts.filter(a => a.category === 'accommodation');
-    const others = acts.filter(a => a.category !== 'accommodation');
+    const dayStays = stayByDay[dayNum] || [];
 
     let inner = '';
-    if (stays.length) {
-      inner += `<div class="day-section-label">🏨 Stay</div>`;
-      inner += stays.map(a => renderAccommodation(a)).join('');
+
+    // Stay banners at the top of the day
+    if (dayStays.length) {
+      dayStays.forEach(({ stay, kind }) => {
+        inner += renderStayBanner(stay, kind);
+      });
     }
 
-    if (!others.length && !stays.length) {
-      inner = `
-        <div class="no-activities">
-          <div>Nothing planned for this day</div>
-          <button class="btn btn-sm btn-primary" data-action="add-day" data-day="${dayNum}">+ Add activity</button>
-        </div>`;
-    } else if (others.length) {
-      inner += `<div class="day-section-label">Schedule</div>`;
-      inner += others.map(a => renderActivity(a)).join('');
-    } else if (!others.length && stays.length) {
+    if (!acts.length) {
       inner += `
         <div class="no-activities">
-          <div>No activities scheduled for this day</div>
-          <button class="btn btn-sm btn-primary" data-action="add-day" data-day="${dayNum}">+ Add activity</button>
+          <div>${dayStays.length ? 'No activities scheduled' : 'Nothing planned for this day'}</div>
         </div>`;
+    } else {
+      if (dayStays.length) inner += `<div class="day-section-label">Schedule</div>`;
+      inner += acts.map(a => renderActivity(a)).join('');
     }
 
     const mapId = `day-map-${dayNum}`;
 
-    return `
+    parts.push(`
       <div class="day-block" data-day="${dayNum}">
         <div class="day-header">
           <h3><span class="day-num">${dayNum}</span> ${escapeHtml(dateLabel || 'Day ' + dayNum)}</h3>
@@ -636,10 +902,13 @@ function renderSchedule(trip, activities) {
         </div>
         <div class="activity-list">${inner}</div>
         <div class="map-container hidden" id="${mapId}" data-day-map="${dayNum}"></div>
-      </div>`;
-  }).join('');
+        <div class="day-add-footer">
+          <button class="btn btn-sm btn-primary" data-action="add-day" data-day="${dayNum}">+ Add Activity to Day ${dayNum}</button>
+        </div>
+      </div>`);
+  }
 
-  container.innerHTML = html;
+  container.innerHTML = parts.join('');
 
   // Wire buttons
   container.querySelectorAll('button[data-action]').forEach(btn => {
@@ -648,17 +917,46 @@ function renderSchedule(trip, activities) {
       const action = btn.dataset.action;
       if (action === 'add-day') return openActivityForm(null, Number(btn.dataset.day));
       if (action === 'toggle-map') return toggleDayMap(Number(btn.dataset.day));
+      if (action === 'edit-stay') return openStayForm(Number(btn.dataset.id));
       const id = Number(btn.dataset.id);
       if (action === 'edit') return openActivityForm(id);
       if (action === 'delete') return handleDeleteActivity(id);
       if (action === 'toggle') return handleToggleComplete(id);
+      if (action === 'preview-attachment') return openAttachmentPreview(id);
     });
   });
+}
+
+function renderStayBanner(stay, kind) {
+  let badge;
+  if (kind === 'checkin') badge = `<span class="sb-badge checkin">Check-in ${stay.checkInTime || '15:00'}</span>`;
+  else if (kind === 'checkout') badge = `<span class="sb-badge checkout">Check-out ${stay.checkOutTime || '12:00'}</span>`;
+  else badge = `<span class="sb-badge">Night</span>`;
+
+  return `
+    <div class="stay-banner">
+      <div class="sb-icon" aria-hidden="true">🏨</div>
+      <div class="sb-text">Staying at <strong>${escapeHtml(stay.name)}</strong>${stay.address ? ` · <span class="subtle">${escapeHtml(stay.address)}</span>` : ''}</div>
+      ${badge}
+      <button class="btn btn-sm btn-ghost" data-action="edit-stay" data-id="${stay.id}" title="Edit stay">✎</button>
+    </div>
+  `;
+}
+
+function renderAttachmentChips(atts) {
+  if (!atts || !atts.length) return '';
+  return `<div class="attachment-chips">${atts.map(a => `
+    <button type="button" class="attachment-chip" data-action="preview-attachment" data-id="${a.id}" title="${escapeHtml(a.name)}">
+      <span aria-hidden="true">${attachmentIcon(a.type)}</span>
+      <span class="att-chip-name">${escapeHtml(a.name)}</span>
+    </button>
+  `).join('')}</div>`;
 }
 
 function renderActivity(a) {
   const emoji = CATEGORY_EMOJI[a.category] || '📌';
   const endTime = a.time && a.duration ? addMinutesToTime(a.time, a.duration) : '';
+  const atts = a._attachments || [];
   const metaParts = [];
   if (a.duration) metaParts.push(`<span title="Duration">⏱ ${fmtDuration(a.duration)}</span>`);
   if (Number(a.cost) > 0) metaParts.push(`<span title="Cost">💵 ${fmtMoney(a.cost)}</span>`);
@@ -693,6 +991,7 @@ function renderActivity(a) {
         ${a.description ? `<div class="activity-desc">${escapeHtml(a.description)}</div>` : ''}
         ${metaParts.length ? `<div class="activity-meta">${metaParts.join('')}</div>` : ''}
         ${transportHtml}
+        ${renderAttachmentChips(atts)}
       </div>
       <div class="activity-actions">
         <button class="btn btn-sm btn-ghost" data-action="toggle" data-id="${a.id}" title="${a.completed ? 'Undo' : 'Mark done'}">${a.completed ? '↺' : '✓'}</button>
@@ -781,12 +1080,24 @@ async function renderTripMap() {
   const trip = await getTrip(state.currentTripId);
   if (!trip) return;
   const acts = await getActivitiesByTrip(trip.id);
+  const stays = await getStaysByTrip(trip.id);
   const sorted = [...acts].sort((a, b) => {
     if (a.day !== b.day) return a.day - b.day;
     return (a.time || '').localeCompare(b.time || '');
   });
   const pts = [];
   sorted.forEach(a => activityToMapPoints(a, `Day ${a.day}`).forEach(p => pts.push(p)));
+  // Add stays as pins (once each, at check-in day)
+  stays.forEach(s => {
+    if (Number.isFinite(s.lat) && Number.isFinite(s.lng)) {
+      pts.push({
+        lat: s.lat, lng: s.lng,
+        name: `🏨 ${s.name}`,
+        time: `Check-in Day ${s.checkInDay || 1}`,
+        location: s.address || '',
+      });
+    }
+  });
 
   const container = document.getElementById('trip-map');
   const empty = document.getElementById('trip-map-empty');
@@ -808,6 +1119,266 @@ function dayHasCoords(acts, day) {
     if (a.category === 'transport' && Number.isFinite(a.transportToLat) && Number.isFinite(a.transportToLng)) return true;
     return false;
   });
+}
+
+/* =============================================================
+ * STAYS TAB
+ * ============================================================= */
+async function renderStaysTab() {
+  const trip = await getTrip(state.currentTripId);
+  if (!trip) return;
+  const stays = await getStaysByTrip(trip.id);
+  const list = document.getElementById('stays-list');
+  const empty = document.getElementById('stays-empty');
+
+  if (!stays.length) {
+    list.innerHTML = '';
+    empty.classList.remove('hidden');
+    return;
+  }
+  empty.classList.add('hidden');
+
+  // Hydrate attachments
+  await Promise.all(stays.map(async s => {
+    s._attachments = await getAttachmentsForParent('stay', s.id);
+  }));
+
+  stays.sort((a, b) => (a.checkInDay || 1) - (b.checkInDay || 1));
+
+  list.innerHTML = stays.map(s => {
+    const cin = s.checkInDay || 1;
+    const nights = s.nights || 1;
+    const cout = cin + nights;
+    const cinLabel = trip.startDate ? addDaysLabel(trip.startDate, cin - 1) : `Day ${cin}`;
+    const coutLabel = trip.startDate ? addDaysLabel(trip.startDate, cout - 1) : `Day ${cout}`;
+
+    const meta = [];
+    if (Number(s.cost) > 0) meta.push(`💵 ${fmtMoney(s.cost)}`);
+    if (s.confirmation) meta.push(`🎫 ${escapeHtml(s.confirmation)}`);
+    if (s.contact) meta.push(`📞 ${escapeHtml(s.contact)}`);
+    if (s.website) meta.push(`🔗 <a href="${escapeHtml(s.website)}" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline">Website</a>`);
+
+    return `
+      <div class="stay-card" data-stay-id="${s.id}">
+        <div class="stay-head">
+          <div class="stay-icon">🏨</div>
+          <div class="stay-name">${escapeHtml(s.name)}</div>
+          <div class="stay-nights">${nights} night${nights === 1 ? '' : 's'}</div>
+        </div>
+        ${s.address ? `<div class="stay-address">📍 ${escapeHtml(s.address)}</div>` : ''}
+        <div class="stay-dates">
+          <div class="sd-item">
+            <span class="sd-label">Check-in</span>
+            <span class="sd-value">${escapeHtml(cinLabel)}${s.checkInTime ? ' · ' + s.checkInTime : ''}</span>
+          </div>
+          <div class="sd-item">
+            <span class="sd-label">Check-out</span>
+            <span class="sd-value">${escapeHtml(coutLabel)}${s.checkOutTime ? ' · ' + s.checkOutTime : ''}</span>
+          </div>
+        </div>
+        ${meta.length ? `<div class="stay-meta">${meta.map(m => `<span>${m}</span>`).join('')}</div>` : ''}
+        ${s.notes ? `<div class="stay-address">${escapeHtml(s.notes)}</div>` : ''}
+        ${renderAttachmentChips(s._attachments)}
+        <div class="stay-actions">
+          <button class="btn btn-sm btn-ghost" data-action="edit-stay-full" data-id="${s.id}">Edit</button>
+          <button class="btn btn-sm btn-danger-ghost" data-action="delete-stay" data-id="${s.id}">Delete</button>
+        </div>
+      </div>`;
+  }).join('');
+
+  list.querySelectorAll('button[data-action]').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const id = Number(btn.dataset.id);
+      const action = btn.dataset.action;
+      if (action === 'edit-stay-full') return openStayForm(id);
+      if (action === 'delete-stay') return handleDeleteStay(id);
+      if (action === 'preview-attachment') return openAttachmentPreview(id);
+    });
+  });
+}
+
+async function handleDeleteStay(id) {
+  const s = await getStay(id);
+  if (!s) return;
+  if (!confirm(`Delete stay "${s.name}"?`)) return;
+  await deleteStayDB(id);
+  toast('Stay deleted', 'success');
+  await renderStaysTab();
+  await renderTripDetail();
+}
+
+/* =============================================================
+ * IDEAS TAB
+ * ============================================================= */
+async function renderIdeasTab() {
+  const trip = await getTrip(state.currentTripId);
+  if (!trip) return;
+  const ideas = await getIdeasByTrip(trip.id);
+  const list = document.getElementById('ideas-list');
+  const empty = document.getElementById('ideas-empty');
+
+  if (!ideas.length) {
+    list.innerHTML = '';
+    empty.classList.remove('hidden');
+    return;
+  }
+  empty.classList.add('hidden');
+
+  ideas.sort((a, b) => (a.scheduledDays?.length ? 1 : 0) - (b.scheduledDays?.length ? 1 : 0)
+                    || (b.createdAt || 0) - (a.createdAt || 0));
+
+  list.innerHTML = ideas.map(i => {
+    const emoji = CATEGORY_EMOJI[i.category] || '📌';
+    const scheduled = Array.isArray(i.scheduledDays) && i.scheduledDays.length;
+    return `
+      <div class="idea-card ${scheduled ? 'scheduled' : ''}" data-idea-id="${i.id}">
+        <div class="idea-head">
+          <div class="idea-name"><span aria-hidden="true">${emoji}</span> ${escapeHtml(i.name)}</div>
+          <span class="idea-cat">${CATEGORY_LABEL[i.category] || 'Other'}</span>
+        </div>
+        ${i.location ? `<div class="idea-loc">📍 ${escapeHtml(i.location)}</div>` : ''}
+        ${i.notes ? `<div class="idea-notes">${escapeHtml(i.notes)}</div>` : ''}
+        ${scheduled ? `<div class="idea-tags">${i.scheduledDays.map(d => `<span class="tag">Scheduled Day ${d}</span>`).join('')}</div>` : ''}
+        <div class="idea-actions">
+          <button class="btn btn-sm btn-primary" data-action="schedule-idea" data-id="${i.id}">Schedule</button>
+          <button class="btn btn-sm btn-ghost" data-action="edit-idea" data-id="${i.id}">Edit</button>
+          <button class="btn btn-sm btn-danger-ghost" data-action="delete-idea" data-id="${i.id}">Delete</button>
+        </div>
+      </div>`;
+  }).join('');
+
+  list.querySelectorAll('button[data-action]').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const id = Number(btn.dataset.id);
+      const action = btn.dataset.action;
+      if (action === 'schedule-idea') return openScheduleIdea(id);
+      if (action === 'edit-idea') return openIdeaForm(id);
+      if (action === 'delete-idea') return handleDeleteIdea(id);
+    });
+  });
+}
+
+async function handleDeleteIdea(id) {
+  const i = await getIdea(id);
+  if (!i) return;
+  if (!confirm(`Delete idea "${i.name}"?`)) return;
+  await deleteIdeaDB(id);
+  toast('Idea deleted', 'success');
+  await renderIdeasTab();
+}
+
+/* =============================================================
+ * PEOPLE TAB
+ * ============================================================= */
+async function renderPeopleTab() {
+  const notice = document.getElementById('people-signin-notice');
+  const content = document.getElementById('people-content');
+
+  if (!state.user) {
+    notice.classList.remove('hidden');
+    content.classList.add('hidden');
+    return;
+  }
+  notice.classList.add('hidden');
+  content.classList.remove('hidden');
+
+  const trip = await getTrip(state.currentTripId);
+  if (!trip) return;
+  const list = document.getElementById('people-list');
+
+  const isOwner = trip.ownerUid === state.user.uid;
+  const rows = [];
+
+  // Owner row
+  const ownerLabel = isOwner
+    ? (state.user.email || 'You')
+    : (trip.ownerEmail || 'Owner');
+  const ownerAvatarInitial = (ownerLabel || 'O').charAt(0).toUpperCase();
+  const ownerAvatarSrc = isOwner && state.user.photoURL
+    ? `<img src="${state.user.photoURL}" referrerpolicy="no-referrer" alt="" />`
+    : ownerAvatarInitial;
+
+  rows.push(`
+    <div class="person-row">
+      <div class="person-avatar">${ownerAvatarSrc}</div>
+      <div class="person-info">
+        <div class="person-email">${escapeHtml(ownerLabel)}${isOwner ? ' (you)' : ''}</div>
+        <div class="person-role">Owner · full access</div>
+      </div>
+      <span class="person-badge">Owner</span>
+    </div>
+  `);
+
+  const collabs = Array.isArray(trip.collaborators) ? trip.collaborators : [];
+  collabs.forEach(email => {
+    const isMe = state.user.email && state.user.email.toLowerCase() === email.toLowerCase();
+    rows.push(`
+      <div class="person-row">
+        <div class="person-avatar">${(email || '?').charAt(0).toUpperCase()}</div>
+        <div class="person-info">
+          <div class="person-email">${escapeHtml(email)}${isMe ? ' (you)' : ''}</div>
+          <div class="person-role">Editor · full access</div>
+        </div>
+        ${isOwner ? `<button class="btn btn-sm btn-danger-ghost" data-action="remove-collab" data-email="${escapeHtml(email)}">Remove</button>` : `<span class="person-badge">Editor</span>`}
+      </div>
+    `);
+  });
+
+  list.innerHTML = rows.join('');
+
+  list.querySelectorAll('button[data-action="remove-collab"]').forEach(btn => {
+    btn.addEventListener('click', () => handleRemoveCollaborator(btn.dataset.email));
+  });
+
+  // Show / hide invite form based on ownership
+  const inviteForm = document.getElementById('invite-form');
+  const inviteWrap = inviteForm && inviteForm.parentElement;
+  if (inviteForm) {
+    inviteForm.style.display = isOwner ? '' : 'none';
+    if (!isOwner && inviteForm.nextElementSibling) {
+      inviteForm.nextElementSibling.style.display = 'none';
+    }
+  }
+}
+
+async function handleInviteCollaborator(e) {
+  e.preventDefault();
+  if (!state.user) { toast('Sign in first', 'error'); return; }
+  const trip = await getTrip(state.currentTripId);
+  if (!trip) return;
+  if (trip.ownerUid !== state.user.uid) {
+    toast('Only the trip owner can invite', 'error');
+    return;
+  }
+  const emailInput = document.getElementById('invite-email');
+  const email = (emailInput.value || '').trim().toLowerCase();
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    toast('Enter a valid email', 'error');
+    return;
+  }
+  if (email === (state.user.email || '').toLowerCase()) {
+    toast("You're already the owner", 'error');
+    return;
+  }
+  const list = Array.isArray(trip.collaborators) ? [...trip.collaborators] : [];
+  if (list.includes(email)) { toast('Already invited', 'error'); return; }
+  list.push(email);
+  await saveTrip({ ...trip, collaborators: list, ownerEmail: state.user.email || null });
+  emailInput.value = '';
+  toast(`Invited ${email}`, 'success');
+  await renderPeopleTab();
+}
+
+async function handleRemoveCollaborator(email) {
+  if (!confirm(`Remove ${email}? They will lose access to this trip.`)) return;
+  const trip = await getTrip(state.currentTripId);
+  if (!trip) return;
+  const list = (trip.collaborators || []).filter(e => e.toLowerCase() !== email.toLowerCase());
+  await saveTrip({ ...trip, collaborators: list });
+  toast('Collaborator removed', 'success');
+  await renderPeopleTab();
 }
 
 async function renderWeather() {
@@ -935,7 +1506,9 @@ async function handleExportPDF() {
   const trip = await getTrip(state.currentTripId);
   if (!trip) return;
   const acts = await getActivitiesByTrip(trip.id);
-  const totalCost = acts.reduce((s, a) => s + (Number(a.cost) || 0), 0);
+  const stays = await getStaysByTrip(trip.id);
+  const totalCost = acts.reduce((s, a) => s + (Number(a.cost) || 0), 0)
+                  + stays.reduce((s, x) => s + (Number(x.cost) || 0), 0);
 
   // Sort
   acts.sort((a, b) => {
@@ -947,30 +1520,47 @@ async function handleExportPDF() {
   for (let d = 1; d <= trip.days; d++) byDay[d] = [];
   acts.forEach(a => { if (a.day >= 1 && a.day <= trip.days) byDay[a.day].push(a); });
 
+  // Map stays -> per-day banners
+  const stayByDay = {};
+  stays.forEach(s => {
+    const cin = Math.max(1, s.checkInDay || 1);
+    const nights = Math.max(1, s.nights || 1);
+    for (let d = cin; d <= Math.min(trip.days, cin + nights); d++) {
+      if (!stayByDay[d]) stayByDay[d] = [];
+      stayByDay[d].push({ stay: s, isCheckIn: d === cin, isCheckOut: d === cin + nights });
+    }
+  });
+
   const dayHtml = Object.keys(byDay).map(d => {
     const dayNum = Number(d);
-    const dActs = byDay[d];
-    const stays = dActs.filter(a => a.category === 'accommodation');
-    const others = dActs.filter(a => a.category !== 'accommodation');
-    const dayCost = dActs.reduce((s, a) => s + (Number(a.cost) || 0), 0);
+    const others = byDay[d];
+    const dayCost = others.reduce((s, a) => s + (Number(a.cost) || 0), 0);
     const dateLabel = trip.startDate ? addDaysLabel(trip.startDate, dayNum - 1) : '';
+    const dayStays = stayByDay[dayNum] || [];
 
     let staysHtml = '';
-    if (stays.length) {
-      staysHtml = `<div class="pdf-section-label">Stay</div>` + stays.map(a => `
-        <div class="pdf-stay">
-          <div class="pdf-stay-name">🏨 ${escapeHtml(a.name)}</div>
-          ${(a.acAddress || a.location) ? `<div class="pdf-stay-addr">${escapeHtml(a.acAddress || a.location)}</div>` : ''}
-          <div class="pdf-stay-meta">
-            ${a.acCheckIn ? `<span><b>Check-in:</b> ${escapeHtml(a.acCheckIn)}</span>` : ''}
-            ${a.acCheckOut ? `<span><b>Check-out:</b> ${escapeHtml(a.acCheckOut)}</span>` : ''}
-            ${a.acNights ? `<span><b>Nights:</b> ${a.acNights}</span>` : ''}
-            ${a.acConfirmation ? `<span><b>Booking:</b> ${escapeHtml(a.acConfirmation)}</span>` : ''}
-            ${a.acContact ? `<span><b>Contact:</b> ${escapeHtml(a.acContact)}</span>` : ''}
-            ${Number(a.cost) > 0 ? `<span><b>Cost:</b> ${fmtMoney(a.cost)}</span>` : ''}
-          </div>
-        </div>
-      `).join('');
+    if (dayStays.length) {
+      staysHtml = `<div class="pdf-section-label">Stay</div>` + dayStays.map(({ stay: a, isCheckIn, isCheckOut }) => {
+        if (isCheckIn) {
+          return `
+            <div class="pdf-stay">
+              <div class="pdf-stay-name">🏨 ${escapeHtml(a.name)} <span style="color:#0f9d58;font-size:9.5px;background:#e6f4ec;padding:1px 6px;border-radius:8px;margin-left:6px">CHECK-IN</span></div>
+              ${a.address ? `<div class="pdf-stay-addr">${escapeHtml(a.address)}</div>` : ''}
+              <div class="pdf-stay-meta">
+                ${a.checkInTime ? `<span><b>Check-in:</b> ${escapeHtml(a.checkInTime)}</span>` : ''}
+                <span><b>Nights:</b> ${a.nights}</span>
+                ${a.confirmation ? `<span><b>Booking:</b> ${escapeHtml(a.confirmation)}</span>` : ''}
+                ${a.contact ? `<span><b>Contact:</b> ${escapeHtml(a.contact)}</span>` : ''}
+                ${Number(a.cost) > 0 ? `<span><b>Cost:</b> ${fmtMoney(a.cost)}</span>` : ''}
+              </div>
+              ${a.notes ? `<div class="pdf-stay-addr" style="margin-top:4px">${escapeHtml(a.notes)}</div>` : ''}
+            </div>`;
+        }
+        if (isCheckOut) {
+          return `<div class="pdf-stay" style="background:#fdf2df;border-color:#f0d78c"><div class="pdf-stay-name">🏨 Check out from ${escapeHtml(a.name)}${a.checkOutTime ? ' · ' + escapeHtml(a.checkOutTime) : ''}</div></div>`;
+        }
+        return `<div class="pdf-stay" style="padding:6px 12px;font-size:11px"><b>🏨 Staying at ${escapeHtml(a.name)}</b></div>`;
+      }).join('');
     }
 
     let actsHtml = '';
@@ -1005,7 +1595,7 @@ async function handleExportPDF() {
       }).join('');
     }
 
-    if (!stays.length && !others.length) {
+    if (!dayStays.length && !others.length) {
       actsHtml = `<div class="pdf-empty">No activities scheduled</div>`;
     }
 
@@ -1131,10 +1721,24 @@ async function handleExportTrip() {
   const trip = await getTrip(state.currentTripId);
   if (!trip) return;
   const acts = await getActivitiesByTrip(trip.id);
+  const stays = await getStaysByTrip(trip.id);
+  const ideas = await getIdeasByTrip(trip.id);
   const payload = {
     name: trip.name, startDate: trip.startDate, days: trip.days,
     description: trip.description || '', budget: trip.budget || 0,
     locationName: trip.locationName || '', lat: trip.lat, lng: trip.lng,
+    stays: stays.map(s => ({
+      name: s.name, checkInDay: s.checkInDay, nights: s.nights,
+      checkInTime: s.checkInTime, checkOutTime: s.checkOutTime,
+      address: s.address, cost: s.cost, confirmation: s.confirmation,
+      contact: s.contact, website: s.website, notes: s.notes,
+      lat: s.lat, lng: s.lng,
+    })),
+    ideas: ideas.map(i => ({
+      name: i.name, category: i.category, location: i.location, notes: i.notes,
+      cost: i.cost, duration: i.duration, lat: i.lat, lng: i.lng,
+      scheduledDays: i.scheduledDays,
+    })),
     activities: acts.map(a => ({
       name: a.name, description: a.description, day: a.day, time: a.time,
       duration: a.duration, cost: a.cost, travelTime: a.travelTime,
@@ -1175,6 +1779,7 @@ async function handleDeleteTrip() {
 async function openActivityForm(activityId = null, defaultDay = null) {
   state.editingActivityId = activityId;
   state.pickedCoord = null;
+  state.pendingAttachments = [];
   const form = document.getElementById('activity-form');
   form.reset();
   document.getElementById('coord-preview').classList.add('hidden');
@@ -1203,12 +1808,7 @@ async function openActivityForm(activityId = null, defaultDay = null) {
     document.getElementById('af-tp-carrier').value = a.transportCarrier || '';
     document.getElementById('af-tp-from').value = a.transportFrom || '';
     document.getElementById('af-tp-to').value = a.transportTo || '';
-    document.getElementById('af-ac-checkin').value = a.acCheckIn || '';
-    document.getElementById('af-ac-checkout').value = a.acCheckOut || '';
-    document.getElementById('af-ac-nights').value = a.acNights || '';
-    document.getElementById('af-ac-confirmation').value = a.acConfirmation || '';
-    document.getElementById('af-ac-address').value = a.acAddress || '';
-    document.getElementById('af-ac-contact').value = a.acContact || '';
+    // Accommodation fields moved to the Stays tab — legacy activities keep the data but don't show fields
     if (Number.isFinite(a.lat) && Number.isFinite(a.lng)) {
       state.pickedCoord = { lat: a.lat, lng: a.lng, address: a.location || '' };
       showCoordPreview();
@@ -1220,6 +1820,10 @@ async function openActivityForm(activityId = null, defaultDay = null) {
       state.pickedTransportToCoord = { lat: a.transportToLat, lng: a.transportToLng };
     }
     updateCategoryFieldsVisibility();
+    // Load attachments for editing
+    const existing = await getAttachmentsForParent('activity', activityId);
+    state.pendingAttachments = existing.map(x => ({ ...x, _existing: true }));
+    renderPendingAttachments('af-attachments-list', state.pendingAttachments);
   } else {
     document.getElementById('activity-form-title').textContent = 'Add Activity';
     document.getElementById('af-day').value = defaultDay || 1;
@@ -1230,15 +1834,11 @@ async function openActivityForm(activityId = null, defaultDay = null) {
     document.getElementById('af-category').value = 'sightseeing';
     document.getElementById('af-lat').value = '';
     document.getElementById('af-lng').value = '';
-    document.getElementById('af-ac-checkin').value = '';
-    document.getElementById('af-ac-checkout').value = '';
-    document.getElementById('af-ac-nights').value = '';
-    document.getElementById('af-ac-confirmation').value = '';
-    document.getElementById('af-ac-address').value = '';
-    document.getElementById('af-ac-contact').value = '';
+    // No accommodation fields in activity form anymore
     state.pickedTransportFromCoord = null;
     state.pickedTransportToCoord = null;
     updateCategoryFieldsVisibility();
+    renderPendingAttachments('af-attachments-list', []);
   }
 
   switchView('activity-form');
@@ -1248,7 +1848,6 @@ async function openActivityForm(activityId = null, defaultDay = null) {
 function updateCategoryFieldsVisibility() {
   const cat = document.getElementById('af-category').value;
   document.getElementById('transport-fields').classList.toggle('show', cat === 'transport');
-  document.getElementById('accommodation-fields').classList.toggle('show', cat === 'accommodation');
 }
 
 function showCoordPreview() {
@@ -1350,21 +1949,18 @@ async function handleActivityFormSubmit(e) {
     transportTo: document.getElementById('af-tp-to').value.trim(),
     transportToLat: Number.isFinite(toLat) ? toLat : null,
     transportToLng: Number.isFinite(toLng) ? toLng : null,
-    acCheckIn: document.getElementById('af-ac-checkin').value.trim(),
-    acCheckOut: document.getElementById('af-ac-checkout').value.trim(),
-    acNights: parseInt(document.getElementById('af-ac-nights').value, 10) || null,
-    acConfirmation: document.getElementById('af-ac-confirmation').value.trim(),
-    acAddress: document.getElementById('af-ac-address').value.trim(),
-    acContact: document.getElementById('af-ac-contact').value.trim(),
   };
 
+  let activityId;
   if (state.editingActivityId) {
     const existing = await getActivity(state.editingActivityId);
     await saveActivity({ ...existing, ...payload });
+    activityId = state.editingActivityId;
     toast('Activity updated', 'success');
   } else {
+    activityId = newId();
     await saveActivity({
-      id: newId(),
+      id: activityId,
       ...payload,
       completed: false,
       createdAt: Date.now(),
@@ -1372,7 +1968,11 @@ async function handleActivityFormSubmit(e) {
     toast('Activity added', 'success');
   }
 
+  // Persist attachments
+  await commitPendingAttachments('activity', activityId, trip.id);
+
   state.editingActivityId = null;
+  state.pendingAttachments = [];
   state.pickedCoord = null;
   await renderTripDetail();
   renderWeather();
@@ -1391,6 +1991,421 @@ async function handleToggleComplete(id) {
   a.completed = !a.completed;
   await saveActivity(a);
   await renderTripDetail();
+}
+
+/* =============================================================
+ * STAY FORM
+ * ============================================================= */
+async function openStayForm(stayId = null) {
+  state.editingStayId = stayId;
+  state.pickedStayCoord = null;
+  state.pendingAttachments = [];
+  const form = document.getElementById('stay-form');
+  form.reset();
+  document.getElementById('sf-address-results').classList.add('hidden');
+
+  const trip = await getTrip(state.currentTripId);
+  if (!trip) { switchView('trips'); return; }
+  document.getElementById('sf-checkin-day').max = trip.days;
+
+  if (stayId) {
+    const s = await getStay(stayId);
+    if (!s) return;
+    document.getElementById('stay-form-title').textContent = 'Edit Stay';
+    document.getElementById('sf-name').value = s.name || '';
+    document.getElementById('sf-checkin-day').value = s.checkInDay || 1;
+    document.getElementById('sf-nights').value = s.nights || 1;
+    document.getElementById('sf-checkin-time').value = s.checkInTime || '15:00';
+    document.getElementById('sf-checkout-time').value = s.checkOutTime || '12:00';
+    document.getElementById('sf-address').value = s.address || '';
+    document.getElementById('sf-cost').value = s.cost || 0;
+    document.getElementById('sf-confirmation').value = s.confirmation || '';
+    document.getElementById('sf-contact').value = s.contact || '';
+    document.getElementById('sf-website').value = s.website || '';
+    document.getElementById('sf-notes').value = s.notes || '';
+    if (Number.isFinite(s.lat) && Number.isFinite(s.lng)) {
+      state.pickedStayCoord = { lat: s.lat, lng: s.lng };
+    }
+    const existing = await getAttachmentsForParent('stay', stayId);
+    renderPendingAttachments('sf-attachments-list', existing.map(a => ({ ...a, _existing: true })));
+    state.pendingAttachments = existing.map(a => ({ ...a, _existing: true }));
+  } else {
+    document.getElementById('stay-form-title').textContent = 'Add Stay';
+    document.getElementById('sf-checkin-day').value = 1;
+    document.getElementById('sf-nights').value = 1;
+    document.getElementById('sf-checkin-time').value = '15:00';
+    document.getElementById('sf-checkout-time').value = '12:00';
+    document.getElementById('sf-cost').value = 0;
+    renderPendingAttachments('sf-attachments-list', []);
+  }
+
+  switchView('stay-form');
+  setTimeout(() => document.getElementById('sf-name').focus(), 80);
+}
+
+async function handleStayFormSubmit(e) {
+  e.preventDefault();
+  const trip = await getTrip(state.currentTripId);
+  if (!trip) return;
+
+  const name = document.getElementById('sf-name').value.trim();
+  const checkInDay = parseInt(document.getElementById('sf-checkin-day').value, 10);
+  const nights = parseInt(document.getElementById('sf-nights').value, 10);
+  if (!name || !checkInDay || !nights || nights < 1) {
+    toast('Please fill all required fields', 'error');
+    return;
+  }
+  if (checkInDay < 1 || checkInDay > trip.days) {
+    toast(`Check-in day must be 1–${trip.days}`, 'error');
+    return;
+  }
+
+  const address = document.getElementById('sf-address').value.trim();
+  let lat = null, lng = null;
+  if (state.pickedStayCoord) { lat = state.pickedStayCoord.lat; lng = state.pickedStayCoord.lng; }
+  else if (address) {
+    try {
+      const r = await window.MapMod.geocode(address, 1);
+      if (r.length) { lat = r[0].lat; lng = r[0].lng; }
+    } catch (e) {}
+  }
+
+  const payload = {
+    tripId: trip.id,
+    name,
+    checkInDay,
+    nights,
+    checkInTime: document.getElementById('sf-checkin-time').value,
+    checkOutTime: document.getElementById('sf-checkout-time').value,
+    address,
+    cost: parseFloat(document.getElementById('sf-cost').value) || 0,
+    confirmation: document.getElementById('sf-confirmation').value.trim(),
+    contact: document.getElementById('sf-contact').value.trim(),
+    website: document.getElementById('sf-website').value.trim(),
+    notes: document.getElementById('sf-notes').value.trim(),
+    lat: Number.isFinite(lat) ? lat : null,
+    lng: Number.isFinite(lng) ? lng : null,
+  };
+
+  let stayId;
+  if (state.editingStayId) {
+    const existing = await getStay(state.editingStayId);
+    await saveStay({ ...existing, ...payload });
+    stayId = state.editingStayId;
+    toast('Stay updated', 'success');
+  } else {
+    stayId = newId();
+    await saveStay({ id: stayId, ...payload, createdAt: Date.now() });
+    toast('Stay added', 'success');
+  }
+
+  // Persist pending attachments
+  await commitPendingAttachments('stay', stayId, trip.id);
+
+  state.editingStayId = null;
+  state.pendingAttachments = [];
+  await renderTripDetail();
+  await renderStaysTab();
+  switchView('trip-detail');
+  switchTab('stays');
+}
+
+/* =============================================================
+ * IDEA FORM
+ * ============================================================= */
+async function openIdeaForm(ideaId = null) {
+  state.editingIdeaId = ideaId;
+  state.pickedIdeaCoord = null;
+  const form = document.getElementById('idea-form');
+  form.reset();
+  document.getElementById('if-location-results').classList.add('hidden');
+
+  const trip = await getTrip(state.currentTripId);
+  if (!trip) return;
+
+  if (ideaId) {
+    const i = await getIdea(ideaId);
+    if (!i) return;
+    document.getElementById('idea-form-title').textContent = 'Edit Idea';
+    document.getElementById('if-name').value = i.name || '';
+    document.getElementById('if-category').value = i.category || 'sightseeing';
+    document.getElementById('if-location').value = i.location || '';
+    document.getElementById('if-notes').value = i.notes || '';
+    document.getElementById('if-cost').value = i.cost || '';
+    document.getElementById('if-duration').value = i.duration || '';
+    if (Number.isFinite(i.lat) && Number.isFinite(i.lng)) {
+      state.pickedIdeaCoord = { lat: i.lat, lng: i.lng };
+    }
+  } else {
+    document.getElementById('idea-form-title').textContent = 'Add Idea';
+    document.getElementById('if-category').value = 'sightseeing';
+  }
+
+  switchView('idea-form');
+  setTimeout(() => document.getElementById('if-name').focus(), 80);
+}
+
+async function handleIdeaFormSubmit(e) {
+  e.preventDefault();
+  const trip = await getTrip(state.currentTripId);
+  if (!trip) return;
+
+  const name = document.getElementById('if-name').value.trim();
+  if (!name) { toast('Name is required', 'error'); return; }
+
+  const location = document.getElementById('if-location').value.trim();
+  let lat = null, lng = null;
+  if (state.pickedIdeaCoord) { lat = state.pickedIdeaCoord.lat; lng = state.pickedIdeaCoord.lng; }
+  else if (location) {
+    try {
+      const r = await window.MapMod.geocode(location, 1);
+      if (r.length) { lat = r[0].lat; lng = r[0].lng; }
+    } catch (e) {}
+  }
+
+  const payload = {
+    tripId: trip.id,
+    name,
+    category: document.getElementById('if-category').value,
+    location,
+    notes: document.getElementById('if-notes').value.trim(),
+    cost: parseFloat(document.getElementById('if-cost').value) || 0,
+    duration: parseInt(document.getElementById('if-duration').value, 10) || 0,
+    lat: Number.isFinite(lat) ? lat : null,
+    lng: Number.isFinite(lng) ? lng : null,
+  };
+
+  if (state.editingIdeaId) {
+    const existing = await getIdea(state.editingIdeaId);
+    await saveIdea({ ...existing, ...payload });
+    toast('Idea updated', 'success');
+  } else {
+    await saveIdea({
+      id: newId(),
+      ...payload,
+      scheduledDays: [],
+      createdAt: Date.now(),
+    });
+    toast('Idea saved', 'success');
+  }
+
+  state.editingIdeaId = null;
+  switchView('trip-detail');
+  switchTab('ideas');
+  await renderIdeasTab();
+}
+
+/* =============================================================
+ * SCHEDULE IDEA (promote to activity)
+ * ============================================================= */
+async function openScheduleIdea(ideaId) {
+  const idea = await getIdea(ideaId);
+  if (!idea) return;
+  const trip = await getTrip(state.currentTripId);
+  if (!trip) return;
+
+  state.schedulingIdeaId = ideaId;
+  document.getElementById('sim-idea-name').textContent = idea.name;
+  document.getElementById('sim-day').max = trip.days;
+  document.getElementById('sim-day').value = 1;
+  document.getElementById('sim-time').value = '09:00';
+  document.getElementById('schedule-idea-modal').classList.remove('hidden');
+}
+
+function closeScheduleIdeaModal() {
+  document.getElementById('schedule-idea-modal').classList.add('hidden');
+  state.schedulingIdeaId = null;
+}
+
+async function handleScheduleIdeaSubmit(e) {
+  e.preventDefault();
+  const idea = await getIdea(state.schedulingIdeaId);
+  if (!idea) return;
+  const trip = await getTrip(state.currentTripId);
+  const day = parseInt(document.getElementById('sim-day').value, 10);
+  const time = document.getElementById('sim-time').value;
+  if (day < 1 || day > trip.days) { toast('Day out of range', 'error'); return; }
+
+  const activity = {
+    id: newId(),
+    tripId: trip.id,
+    name: idea.name,
+    description: idea.notes || '',
+    day, time,
+    duration: idea.duration || 60,
+    cost: idea.cost || 0,
+    travelTime: 0,
+    location: idea.location || '',
+    category: idea.category || 'sightseeing',
+    lat: idea.lat || null,
+    lng: idea.lng || null,
+    fromIdeaId: idea.id,
+    completed: false,
+    createdAt: Date.now(),
+  };
+  await saveActivity(activity);
+
+  // Mark idea as scheduled
+  const scheduledDays = Array.isArray(idea.scheduledDays) ? [...idea.scheduledDays] : [];
+  if (!scheduledDays.includes(day)) scheduledDays.push(day);
+  await saveIdea({ ...idea, scheduledDays });
+
+  toast(`Scheduled to Day ${day}`, 'success');
+  closeScheduleIdeaModal();
+  await renderIdeasTab();
+  await renderTripDetail();
+  switchTab('schedule');
+}
+
+/* =============================================================
+ * ATTACHMENTS
+ * ============================================================= */
+function attachmentIcon(type) {
+  if (!type) return '📎';
+  if (type.startsWith('image/')) return '🖼️';
+  if (type === 'application/pdf') return '📄';
+  if (type.startsWith('video/')) return '🎬';
+  if (type.startsWith('audio/')) return '🎵';
+  if (type.includes('word') || type.includes('document')) return '📝';
+  if (type.includes('sheet') || type.includes('excel')) return '📊';
+  return '📎';
+}
+function fmtBytes(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+function renderPendingAttachments(containerId, items) {
+  const el = document.getElementById(containerId);
+  if (!el) return;
+  if (!items.length) { el.innerHTML = ''; return; }
+  el.innerHTML = items.map((a, idx) => `
+    <div class="attachment-row" data-idx="${idx}">
+      <div class="att-icon">${attachmentIcon(a.type)}</div>
+      <div class="att-info" data-action="preview-pending" data-idx="${idx}">
+        <div class="att-name">${escapeHtml(a.name)}</div>
+        <div class="att-size">${fmtBytes(a.size)}${a._existing ? '' : ' · not saved yet'}</div>
+      </div>
+      <button type="button" class="att-remove" data-action="remove-pending" data-idx="${idx}" title="Remove">✕</button>
+    </div>
+  `).join('');
+  el.querySelectorAll('button[data-action="remove-pending"], .att-info[data-action="preview-pending"]').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      const idx = Number(btn.dataset.idx);
+      if (btn.dataset.action === 'remove-pending') {
+        e.stopPropagation();
+        state.pendingAttachments.splice(idx, 1);
+        renderPendingAttachments(containerId, state.pendingAttachments);
+      } else {
+        openAttachmentPreviewFromBlob(state.pendingAttachments[idx]);
+      }
+    });
+  });
+}
+
+async function handleAttachmentPick(fileInputId, listContainerId, e) {
+  const files = Array.from(e.target.files || []);
+  e.target.value = '';
+  for (const f of files) {
+    if (f.size > MAX_ATTACHMENT_SIZE) {
+      toast(`${f.name} is over 5 MB — skipped`, 'error');
+      continue;
+    }
+    state.pendingAttachments.push({
+      name: f.name,
+      type: f.type || 'application/octet-stream',
+      size: f.size,
+      blob: f,
+    });
+  }
+  renderPendingAttachments(listContainerId, state.pendingAttachments);
+}
+
+async function commitPendingAttachments(kind, parentId, tripId) {
+  // Any pending that are NOT _existing → save. Existing ones already in DB.
+  // Also, if _existing was removed from the array, delete from DB.
+  const existingOnServer = await getAttachmentsForParent(kind, parentId);
+  const keptIds = new Set(state.pendingAttachments.filter(a => a._existing).map(a => a.id));
+  for (const srv of existingOnServer) {
+    if (!keptIds.has(srv.id)) await deleteAttachment(srv.id);
+  }
+  for (const a of state.pendingAttachments) {
+    if (a._existing) continue;
+    await saveAttachment({
+      id: newId() + Math.floor(Math.random() * 1000),
+      tripId,
+      parentKey: parentKey(kind, parentId),
+      parentKind: kind,
+      parentId,
+      name: a.name,
+      type: a.type,
+      size: a.size,
+      blob: a.blob,
+      createdAt: Date.now(),
+    });
+  }
+}
+
+async function openAttachmentPreview(id) {
+  const a = await getAttachment(id);
+  if (!a) return;
+  openAttachmentPreviewFromBlob(a);
+}
+
+function openAttachmentPreviewFromBlob(a) {
+  const modal = document.getElementById('attach-preview-modal');
+  const nameEl = document.getElementById('preview-name');
+  const dl = document.getElementById('preview-download');
+  const body = document.getElementById('preview-body');
+  nameEl.textContent = a.name;
+  const url = URL.createObjectURL(a.blob);
+  dl.href = url;
+  dl.download = a.name;
+
+  body.innerHTML = '';
+  if (a.type && a.type.startsWith('image/')) {
+    const img = document.createElement('img');
+    img.src = url;
+    img.alt = a.name;
+    body.appendChild(img);
+  } else if (a.type === 'application/pdf') {
+    const iframe = document.createElement('iframe');
+    iframe.src = url;
+    iframe.title = a.name;
+    body.appendChild(iframe);
+  } else if (a.type && a.type.startsWith('text/')) {
+    a.blob.text().then(txt => {
+      const pre = document.createElement('pre');
+      pre.style.padding = '16px';
+      pre.style.whiteSpace = 'pre-wrap';
+      pre.style.wordBreak = 'break-word';
+      pre.style.margin = '0';
+      pre.style.fontFamily = 'var(--font-mono)';
+      pre.style.fontSize = '12.5px';
+      pre.textContent = txt;
+      body.appendChild(pre);
+    });
+  } else {
+    const fb = document.createElement('div');
+    fb.className = 'preview-fallback';
+    fb.innerHTML = `<div style="font-size:36px;margin-bottom:8px">${attachmentIcon(a.type)}</div>
+      <div>Preview not supported.</div>
+      <div class="subtle">Use Download to open in another app.</div>`;
+    body.appendChild(fb);
+  }
+
+  modal.classList.remove('hidden');
+  // Revoke URL when closed
+  modal._activeUrl = url;
+}
+function closeAttachmentPreview() {
+  const modal = document.getElementById('attach-preview-modal');
+  if (modal._activeUrl) {
+    URL.revokeObjectURL(modal._activeUrl);
+    modal._activeUrl = null;
+  }
+  modal.classList.add('hidden');
 }
 
 /* =============================================================
@@ -1532,6 +2547,50 @@ async function handleImportTrips(file) {
           if (rec.name) await saveActivity(rec);
         }
       }
+      if (Array.isArray(raw.stays)) {
+        for (const s of raw.stays) {
+          if (!s || !s.name) continue;
+          await new Promise(r => setTimeout(r, 1));
+          await saveStay({
+            id: newId(),
+            tripId: trip.id,
+            name: String(s.name),
+            checkInDay: parseInt(s.checkInDay, 10) || 1,
+            nights: parseInt(s.nights, 10) || 1,
+            checkInTime: String(s.checkInTime || '15:00'),
+            checkOutTime: String(s.checkOutTime || '12:00'),
+            address: String(s.address || ''),
+            cost: parseFloat(s.cost) || 0,
+            confirmation: String(s.confirmation || ''),
+            contact: String(s.contact || ''),
+            website: String(s.website || ''),
+            notes: String(s.notes || ''),
+            lat: Number.isFinite(parseFloat(s.lat)) ? parseFloat(s.lat) : null,
+            lng: Number.isFinite(parseFloat(s.lng)) ? parseFloat(s.lng) : null,
+            createdAt: Date.now(),
+          });
+        }
+      }
+      if (Array.isArray(raw.ideas)) {
+        for (const i of raw.ideas) {
+          if (!i || !i.name) continue;
+          await new Promise(r => setTimeout(r, 1));
+          await saveIdea({
+            id: newId(),
+            tripId: trip.id,
+            name: String(i.name),
+            category: String(i.category || 'sightseeing'),
+            location: String(i.location || ''),
+            notes: String(i.notes || ''),
+            cost: parseFloat(i.cost) || 0,
+            duration: parseInt(i.duration, 10) || 0,
+            lat: Number.isFinite(parseFloat(i.lat)) ? parseFloat(i.lat) : null,
+            lng: Number.isFinite(parseFloat(i.lng)) ? parseFloat(i.lng) : null,
+            scheduledDays: Array.isArray(i.scheduledDays) ? i.scheduledDays : [],
+            createdAt: Date.now(),
+          });
+        }
+      }
       count++;
     }
     toast(`Imported ${count} trip${count === 1 ? '' : 's'}`, 'success');
@@ -1593,17 +2652,8 @@ function registerSW() {
  * EVENT WIRING
  * ============================================================= */
 function wireEvents() {
-  // Back
-  document.getElementById('back-btn').addEventListener('click', () => {
-    if (state.currentView === 'activity-form') {
-      state.editingActivityId = null;
-      switchView('trip-detail');
-    } else if (state.currentView === 'trip-detail') {
-      state.currentTripId = null;
-      window.MapMod.destroyAllMaps();
-      switchView('trips');
-    }
-  });
+  // Back button — assigned as .onclick further below to allow overriding
+
 
   // Theme
   document.getElementById('theme-toggle').addEventListener('click', toggleTheme);
@@ -1721,9 +2771,100 @@ function wireEvents() {
 
   // Escape closes modal
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && !document.getElementById('trip-modal').classList.contains('hidden')) {
-      closeTripModal();
+    if (e.key !== 'Escape') return;
+    const tripM = document.getElementById('trip-modal');
+    const simM = document.getElementById('schedule-idea-modal');
+    const previewM = document.getElementById('attach-preview-modal');
+    if (!tripM.classList.contains('hidden')) closeTripModal();
+    else if (!simM.classList.contains('hidden')) closeScheduleIdeaModal();
+    else if (!previewM.classList.contains('hidden')) closeAttachmentPreview();
+  });
+
+  // ===== Back button — extended for new views =====
+  // (Rewire because we need to know about stays/ideas)
+  document.getElementById('back-btn').removeEventListener?.('click', null);
+  document.getElementById('back-btn').onclick = () => {
+    if (state.currentView === 'activity-form') {
+      state.editingActivityId = null;
+      state.pendingAttachments = [];
+      switchView('trip-detail');
+    } else if (state.currentView === 'stay-form') {
+      state.editingStayId = null;
+      state.pendingAttachments = [];
+      switchView('trip-detail');
+      switchTab('stays');
+    } else if (state.currentView === 'idea-form') {
+      state.editingIdeaId = null;
+      switchView('trip-detail');
+      switchTab('ideas');
+    } else if (state.currentView === 'trip-detail') {
+      state.currentTripId = null;
+      window.MapMod.destroyAllMaps();
+      switchView('trips');
     }
+  };
+
+  // ===== Tabs (new) =====
+  // Handled below by original tab loop, but new tabs auto-work due to data-tab.
+
+  // ===== Stays =====
+  document.getElementById('add-stay-btn').addEventListener('click', () => openStayForm(null));
+  document.getElementById('stay-form').addEventListener('submit', handleStayFormSubmit);
+  document.getElementById('sf-cancel').addEventListener('click', () => {
+    state.editingStayId = null;
+    state.pendingAttachments = [];
+    switchView('trip-detail');
+    switchTab('stays');
+  });
+  window.MapMod.attachGeocodeSearch(
+    document.getElementById('sf-address'),
+    document.getElementById('sf-address-results'),
+    (pick) => {
+      state.pickedStayCoord = { lat: pick.lat, lng: pick.lng };
+      document.getElementById('sf-address').value = pick.address || pick.name;
+    }
+  );
+  document.getElementById('sf-attach-file').addEventListener('change', (e) => {
+    handleAttachmentPick('sf-attach-file', 'sf-attachments-list', e);
+  });
+
+  // ===== Ideas =====
+  document.getElementById('add-idea-btn').addEventListener('click', () => openIdeaForm(null));
+  document.getElementById('idea-form').addEventListener('submit', handleIdeaFormSubmit);
+  document.getElementById('if-cancel').addEventListener('click', () => {
+    state.editingIdeaId = null;
+    switchView('trip-detail');
+    switchTab('ideas');
+  });
+  window.MapMod.attachGeocodeSearch(
+    document.getElementById('if-location'),
+    document.getElementById('if-location-results'),
+    (pick) => {
+      state.pickedIdeaCoord = { lat: pick.lat, lng: pick.lng };
+      document.getElementById('if-location').value = pick.address || pick.name;
+    }
+  );
+
+  // ===== Schedule Idea modal =====
+  document.getElementById('schedule-idea-form').addEventListener('submit', handleScheduleIdeaSubmit);
+  document.getElementById('sim-cancel').addEventListener('click', closeScheduleIdeaModal);
+  document.getElementById('schedule-idea-modal').addEventListener('click', (e) => {
+    if (e.target.id === 'schedule-idea-modal') closeScheduleIdeaModal();
+  });
+
+  // ===== People / invites =====
+  document.getElementById('invite-form').addEventListener('submit', handleInviteCollaborator);
+  document.getElementById('people-signin-btn').addEventListener('click', signIn);
+
+  // ===== Activity form attachments =====
+  document.getElementById('af-attach-file').addEventListener('change', (e) => {
+    handleAttachmentPick('af-attach-file', 'af-attachments-list', e);
+  });
+
+  // ===== Attachment preview modal =====
+  document.getElementById('preview-close').addEventListener('click', closeAttachmentPreview);
+  document.getElementById('attach-preview-modal').addEventListener('click', (e) => {
+    if (e.target.id === 'attach-preview-modal') closeAttachmentPreview();
   });
 }
 

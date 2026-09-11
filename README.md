@@ -4,12 +4,17 @@ An offline-first Progressive Web App for planning travel itineraries. Sync your 
 
 **Features**
 - ✈️ Trips + activities with day/time scheduling, cost, travel time
+- 🏨 **Stays tab** — hotels & lodging entered once, auto-populated on every night of the schedule
+- 💡 **Ideas tab** — parking lot for places you might visit; promote to a specific day when ready
+- 👥 **Collaboration** — invite by Google email, everyone shares full edit access on that trip
+- 📎 **File attachments** — upload booking PDFs, receipts, tickets to any activity or stay (5 MB each, stored locally on device)
 - 🗺️ Leaflet map — pin locations, view daily routes, full-trip map
 - 🔍 Location search + auto-geocode (free, no API key)
-- 🚗 Transport details — flight/train/bus number, carrier, from/to
+- 🚗 Transport details — flight/train/bus number, carrier, from/to, destination pin
 - 💰 Trip budget with real-time utilization %
 - ☀️ Weather forecast (Open-Meteo, no key required)
 - ☁️ Google sign-in + Firebase Firestore for cross-device sync
+- 📄 PDF export for offline reading
 - 📴 Full offline support — install as a PWA
 - 🌗 Light + dark mode with manual toggle
 - 🇲🇾 MYR currency
@@ -32,6 +37,17 @@ An offline-first Progressive Web App for planning travel itineraries. Sync your 
 
 ---
 
+## ⚠️ Upgrading from a previous version?
+
+This release changes the Firestore schema to support **collaboration**. You **must**:
+
+1. Update your Firestore rules using the block in Step 5 below — the old rules won't allow the new root-level `trips/` collection.
+2. Sign in on the app; your existing trips will migrate automatically from `users/{uid}/trips` → `trips/`.
+
+If you skip step 1, you'll see "Missing or insufficient permissions" errors in the console.
+
+---
+
 ## 1. Deploy to Vercel (2 min)
 
 1. Push the folder to a GitHub repo, or drag the folder into [vercel.com/new](https://vercel.com/new)
@@ -48,20 +64,51 @@ The app **works immediately in local-only mode** — no Firebase needed. Do step
 4. In the Firebase console left sidebar:
    - **Authentication → Get started → Sign-in method → Google → Enable** (pick your support email → Save)
    - **Firestore Database → Create database → Start in *production* mode → pick a region (e.g. `asia-southeast1`)**
-5. Firestore → **Rules** tab → replace with:
+5. Firestore → **Rules** tab → replace with the rules below and click **Publish**:
 
    ```
    rules_version = '2';
    service cloud.firestore {
      match /databases/{database}/documents {
+
+       // A trip is readable/writable by its owner or any listed collaborator (email).
+       function isOwner(data) {
+         return request.auth != null && data.ownerUid == request.auth.uid;
+       }
+       function isCollaborator(data) {
+         return request.auth != null
+             && data.collaborators is list
+             && request.auth.token.email != null
+             && data.collaborators.hasAny([request.auth.token.email.lower()]);
+       }
+       function hasAccess(data) {
+         return isOwner(data) || isCollaborator(data);
+       }
+
+       match /trips/{tripId} {
+         // Read: owner or collaborator
+         allow read: if resource == null || hasAccess(resource.data);
+         // Create: must set ownerUid to self
+         allow create: if request.auth != null
+                       && request.resource.data.ownerUid == request.auth.uid;
+         // Update: owner OR collaborator (both have full edit)
+         allow update: if hasAccess(resource.data);
+         // Delete: owner only
+         allow delete: if isOwner(resource.data);
+
+         // Sub-collections (activities, stays, ideas): same access as parent
+         match /{sub}/{docId} {
+           allow read, write: if hasAccess(get(/databases/$(database)/documents/trips/$(tripId)).data);
+         }
+       }
+
+       // Legacy path from earlier versions — kept read/write for one-time migration
        match /users/{uid}/{document=**} {
          allow read, write: if request.auth != null && request.auth.uid == uid;
        }
      }
    }
    ```
-
-   Click **Publish**.
 6. **Authentication → Settings → Authorized domains → Add domain** → add your Vercel domain (e.g. `your-app.vercel.app`). `localhost` is already allowed.
 7. Redeploy Vercel (or just refresh — Firebase config is fetched at runtime).
 
@@ -109,6 +156,17 @@ Optional transport columns: `transportRef`, `transportCarrier`, `transportFrom`,
 ```
 
 ---
+
+## Attachments — local-only
+
+File attachments (booking PDFs, receipts, tickets) are stored **on the device** in IndexedDB. They do NOT sync via Firebase — that would require Firebase Storage (blaze plan / billing account for larger files). Practical consequences:
+
+- Attachments you add on your phone stay on your phone; add them again on desktop if you want them there too
+- They survive app reinstalls if you keep the browser data
+- Deleting an activity / stay removes its attachments
+- Each file is limited to 5 MB
+
+If you want cross-device attachments too, set up Firebase Storage and I'll add the sync logic in a follow-up.
 
 ## Notes on cost & scale
 

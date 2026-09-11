@@ -138,13 +138,45 @@
         <!-- Tabs -->
         <div class="tabs" role="tablist">
           <button class="tab active" data-tab="schedule" role="tab">Schedule</button>
+          <button class="tab" data-tab="stays" role="tab">Stays</button>
+          <button class="tab" data-tab="ideas" role="tab">Ideas</button>
           <button class="tab" data-tab="map" role="tab">Map</button>
+          <button class="tab" data-tab="people" role="tab">People</button>
         </div>
       </div>
 
       <!-- Schedule tab -->
       <div id="tab-schedule" class="tab-panel">
         <div id="schedule" class="schedule"></div>
+      </div>
+
+      <!-- Stays tab -->
+      <div id="tab-stays" class="tab-panel hidden">
+        <div class="toolbar">
+          <button id="add-stay-btn" class="btn btn-primary"><span class="btn-icon">+</span> Add Stay</button>
+        </div>
+        <div id="stays-list" class="stays-list"></div>
+        <div id="stays-empty" class="empty-state hidden">
+          <div class="empty-icon">🏨</div>
+          <h2>No accommodations yet</h2>
+          <p>Add your hotels, Airbnbs, or homestays here. They'll show up automatically on each night of the schedule.</p>
+          <button class="btn btn-primary" onclick="document.getElementById('add-stay-btn').click()">Add Stay</button>
+        </div>
+      </div>
+
+      <!-- Ideas tab -->
+      <div id="tab-ideas" class="tab-panel hidden">
+        <div class="toolbar">
+          <button id="add-idea-btn" class="btn btn-primary"><span class="btn-icon">+</span> Add Idea</button>
+          <span class="ideas-help subtle">Places or activities you're considering. Tap one to schedule it into a day.</span>
+        </div>
+        <div id="ideas-list" class="ideas-list"></div>
+        <div id="ideas-empty" class="empty-state hidden">
+          <div class="empty-icon">💡</div>
+          <h2>No ideas yet</h2>
+          <p>Dump every place you might want to visit here. Schedule them into specific days when you're ready.</p>
+          <button class="btn btn-primary" onclick="document.getElementById('add-idea-btn').click()">Add Idea</button>
+        </div>
       </div>
 
       <!-- Map tab -->
@@ -156,6 +188,29 @@
             <div>No pinned locations yet.</div>
             <div class="subtle">Add coordinates to your activities to see them mapped here.</div>
           </div>
+        </div>
+      </div>
+
+      <!-- People tab -->
+      <div id="tab-people" class="tab-panel hidden">
+        <div id="people-signin-notice" class="signin-prompt hidden">
+          <div class="txt">
+            <strong>Sign in to collaborate</strong>
+            <p>Collaboration needs cloud sync. Sign in with Google to invite others.</p>
+          </div>
+          <button id="people-signin-btn" class="btn btn-primary btn-sm">Sign in</button>
+        </div>
+
+        <div id="people-content" class="hidden">
+          <div class="section-title"><h3>Trip Members</h3></div>
+          <div id="people-list" class="people-list"></div>
+
+          <div class="section-title" style="margin-top:24px"><h3>Invite by Email</h3></div>
+          <form id="invite-form" class="invite-form">
+            <input type="email" id="invite-email" placeholder="collaborator@gmail.com" required autocomplete="email" />
+            <button type="submit" class="btn btn-primary">Invite</button>
+          </form>
+          <p class="help subtle" style="margin-top:8px">Enter their Google email. They'll see this trip the next time they sign in with that account. All collaborators have full edit access.</p>
         </div>
       </div>
     </section>
@@ -210,9 +265,9 @@
             <option value="adventure">🎢 Adventure</option>
             <option value="shopping">🛍️ Shopping</option>
             <option value="transport">🚗 Transport</option>
-            <option value="accommodation">🏨 Accommodation</option>
             <option value="other">📌 Other</option>
           </select>
+          <p class="help">For hotels/lodging, use the <strong>Stays</strong> tab instead.</p>
         </div>
 
         <!-- Location -->
@@ -267,42 +322,156 @@
           <p class="help" style="margin-top:-4px">Pick from search results to auto-pin From and To on the map. The pin above (location) is used as the departure; the destination is added as a second pin and connected by a dashed line.</p>
         </div>
 
-        <!-- Accommodation fields (conditional) -->
-        <div class="form-section" id="accommodation-fields">
-          <h3>Accommodation Details</h3>
-          <div class="form-row">
-            <div class="form-group">
-              <label for="af-ac-checkin">Check-in Time</label>
-              <input type="time" id="af-ac-checkin" />
-            </div>
-            <div class="form-group">
-              <label for="af-ac-checkout">Check-out Time</label>
-              <input type="time" id="af-ac-checkout" />
-            </div>
-          </div>
-          <div class="form-row">
-            <div class="form-group">
-              <label for="af-ac-nights">Nights</label>
-              <input type="number" id="af-ac-nights" min="1" placeholder="e.g. 3" inputmode="numeric" />
-            </div>
-            <div class="form-group">
-              <label for="af-ac-confirmation">Booking / Confirmation #</label>
-              <input type="text" id="af-ac-confirmation" placeholder="e.g. AGD-8827733" />
-            </div>
-          </div>
-          <div class="form-group">
-            <label for="af-ac-address">Address</label>
-            <input type="text" id="af-ac-address" placeholder="Full hotel address" />
-          </div>
-          <div class="form-group">
-            <label for="af-ac-contact">Contact / Phone</label>
-            <input type="text" id="af-ac-contact" placeholder="e.g. +60 3-1234 5678" />
-          </div>
+        <!-- Attachments -->
+        <div class="form-section">
+          <h3>Attachments</h3>
+          <label class="btn btn-ghost btn-sm" style="width:auto">
+            📎 Add file
+            <input type="file" id="af-attach-file" multiple hidden />
+          </label>
+          <p class="help">Upload booking references, receipts, tickets, or any docs. Files up to 5 MB each.</p>
+          <div id="af-attachments-list" class="attachments-list"></div>
         </div>
 
         <div class="form-actions">
           <button type="button" id="af-cancel" class="btn btn-ghost">Cancel</button>
           <button type="submit" class="btn btn-primary">Save Activity</button>
+        </div>
+      </form>
+    </section>
+
+    <!-- ============ VIEW: STAY FORM ============ -->
+    <section id="view-stay-form" class="view">
+      <form id="stay-form" class="form">
+        <h2 id="stay-form-title">Add Stay</h2>
+        <p class="form-sub">Add your hotel, Airbnb, or homestay. It'll auto-populate across every night of your stay.</p>
+
+        <div class="form-group">
+          <label for="sf-name">Name <span class="req">*</span></label>
+          <input type="text" id="sf-name" required maxlength="120" placeholder="e.g. Hotel Equatorial Penang" />
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="sf-checkin-day">Check-in Day # <span class="req">*</span></label>
+            <input type="number" id="sf-checkin-day" required min="1" value="1" inputmode="numeric" />
+          </div>
+          <div class="form-group">
+            <label for="sf-nights">Nights <span class="req">*</span></label>
+            <input type="number" id="sf-nights" required min="1" value="1" inputmode="numeric" />
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="sf-checkin-time">Check-in Time</label>
+            <input type="time" id="sf-checkin-time" value="15:00" />
+          </div>
+          <div class="form-group">
+            <label for="sf-checkout-time">Check-out Time</label>
+            <input type="time" id="sf-checkout-time" value="12:00" />
+          </div>
+        </div>
+
+        <div class="form-group location-search">
+          <label for="sf-address">Address</label>
+          <input type="text" id="sf-address" placeholder="Full address (search or type)" autocomplete="off" />
+          <div id="sf-address-results" class="location-results hidden"></div>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="sf-cost">Total Cost (RM)</label>
+            <input type="number" id="sf-cost" min="0" step="0.01" value="0" inputmode="decimal" />
+          </div>
+          <div class="form-group">
+            <label for="sf-confirmation">Booking / Confirmation #</label>
+            <input type="text" id="sf-confirmation" placeholder="e.g. AGD-8827733" />
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="sf-contact">Contact / Phone</label>
+            <input type="text" id="sf-contact" placeholder="e.g. +60 3-1234 5678" />
+          </div>
+          <div class="form-group">
+            <label for="sf-website">Website / Link</label>
+            <input type="url" id="sf-website" placeholder="https://…" />
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label for="sf-notes">Notes</label>
+          <textarea id="sf-notes" rows="2" placeholder="Room type, breakfast, etc."></textarea>
+        </div>
+
+        <!-- Attachments -->
+        <div class="form-section">
+          <h3>Attachments</h3>
+          <label class="btn btn-ghost btn-sm" style="width:auto">
+            📎 Add file
+            <input type="file" id="sf-attach-file" multiple hidden />
+          </label>
+          <p class="help">Booking confirmation PDF, receipts, etc.</p>
+          <div id="sf-attachments-list" class="attachments-list"></div>
+        </div>
+
+        <div class="form-actions">
+          <button type="button" id="sf-cancel" class="btn btn-ghost">Cancel</button>
+          <button type="submit" class="btn btn-primary">Save Stay</button>
+        </div>
+      </form>
+    </section>
+
+    <!-- ============ VIEW: IDEA FORM ============ -->
+    <section id="view-idea-form" class="view">
+      <form id="idea-form" class="form">
+        <h2 id="idea-form-title">Add Idea</h2>
+        <p class="form-sub">A place or activity you're considering. Schedule it into a day when you're ready.</p>
+
+        <div class="form-group">
+          <label for="if-name">Name <span class="req">*</span></label>
+          <input type="text" id="if-name" required maxlength="120" placeholder="e.g. Penang Hill Funicular" />
+        </div>
+
+        <div class="form-group">
+          <label for="if-category">Category</label>
+          <select id="if-category">
+            <option value="food">🍽️ Food</option>
+            <option value="sightseeing" selected>🏛️ Sightseeing</option>
+            <option value="adventure">🎢 Adventure</option>
+            <option value="shopping">🛍️ Shopping</option>
+            <option value="transport">🚗 Transport</option>
+            <option value="other">📌 Other</option>
+          </select>
+        </div>
+
+        <div class="form-group location-search">
+          <label for="if-location">Location</label>
+          <input type="text" id="if-location" placeholder="Optional — search or type" autocomplete="off" />
+          <div id="if-location-results" class="location-results hidden"></div>
+        </div>
+
+        <div class="form-group">
+          <label for="if-notes">Notes</label>
+          <textarea id="if-notes" rows="3" placeholder="Anything you want to remember about this"></textarea>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="if-cost">Est. Cost (RM)</label>
+            <input type="number" id="if-cost" min="0" step="0.01" placeholder="Optional" inputmode="decimal" />
+          </div>
+          <div class="form-group">
+            <label for="if-duration">Est. Duration (min)</label>
+            <input type="number" id="if-duration" min="0" placeholder="Optional" inputmode="numeric" />
+          </div>
+        </div>
+
+        <div class="form-actions">
+          <button type="button" id="if-cancel" class="btn btn-ghost">Cancel</button>
+          <button type="submit" class="btn btn-primary">Save Idea</button>
         </div>
       </form>
     </section>
@@ -354,6 +523,46 @@
           <button type="submit" class="btn btn-primary">Save Trip</button>
         </div>
       </form>
+    </div>
+  </div>
+
+  <!-- ============ SCHEDULE IDEA MODAL ============ -->
+  <div id="schedule-idea-modal" class="modal-overlay hidden" role="dialog" aria-modal="true">
+    <div class="modal">
+      <form id="schedule-idea-form" class="form">
+        <h2>Schedule Idea</h2>
+        <p class="form-sub"><span id="sim-idea-name" style="font-weight:600;color:var(--text)"></span></p>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="sim-day">Day <span class="req">*</span></label>
+            <input type="number" id="sim-day" required min="1" value="1" inputmode="numeric" />
+          </div>
+          <div class="form-group">
+            <label for="sim-time">Time <span class="req">*</span></label>
+            <input type="time" id="sim-time" required value="09:00" />
+          </div>
+        </div>
+
+        <div class="form-actions">
+          <button type="button" id="sim-cancel" class="btn btn-ghost">Cancel</button>
+          <button type="submit" class="btn btn-primary">Add to Schedule</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ============ ATTACHMENT PREVIEW MODAL ============ -->
+  <div id="attach-preview-modal" class="modal-overlay hidden" role="dialog" aria-modal="true">
+    <div class="modal" style="max-width:820px">
+      <div class="form" style="padding:14px">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+          <strong id="preview-name" style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></strong>
+          <a id="preview-download" class="btn btn-ghost btn-sm" download>Download</a>
+          <button id="preview-close" class="btn btn-ghost btn-sm" type="button">Close</button>
+        </div>
+        <div id="preview-body" class="preview-body"></div>
+      </div>
     </div>
   </div>
 
