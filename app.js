@@ -38,14 +38,19 @@ const state = {
   currentTripId: null,
   editingActivityId: null,
   editingTripId: null,
-  currentView: 'trips',
+  currentView: 'login',
   currentTab: 'schedule',
   user: null,
+  authKnown: false,           // set once we've heard from Firebase
+  offlineMode: false,          // user explicitly chose "continue offline"
   firebaseReady: false,
   firestore: null,
   auth: null,
   unsubTrips: null,
   unsubActs: null,
+  syncingInitial: false,       // true while first sync payload is loading
+  gotOwnedSnap: false,
+  gotCollabSnap: false,
   pickedCoord: null, // { lat, lng, address }
   pickedTripCoord: null,
   pickedTransportFromCoord: null,
@@ -248,11 +253,14 @@ function isFirebaseConfigured() {
 
 async function initFirebase() {
   if (!isFirebaseConfigured()) {
+    // Show the login "no-config" warning and let the user proceed offline
+    document.getElementById('login-config-warn').classList.remove('hidden');
+    document.getElementById('login-google-btn').classList.add('hidden');
     document.getElementById('config-banner').classList.remove('hidden');
-    document.getElementById('signin-prompt').classList.add('hidden');
-    document.getElementById('auth-chip').classList.add('hidden');
+    state.authKnown = true;
     return;
   }
+  document.getElementById('login-config-warn').classList.add('hidden');
   document.getElementById('config-banner').classList.add('hidden');
 
   try {
@@ -268,28 +276,61 @@ async function initFirebase() {
     }
     state.firebaseReady = true;
 
+    // Handle redirect result (in case popup was blocked)
+    try { await state.auth.getRedirectResult(); } catch (e) { /* ignore */ }
+
     state.auth.onAuthStateChanged(handleAuthChange);
   } catch (err) {
     console.error('Firebase init failed:', err);
-    toast('Cloud sync unavailable — running locally.', 'error');
+    document.getElementById('login-config-warn').classList.remove('hidden');
+    state.authKnown = true;
   }
 }
 
-function handleAuthChange(user) {
+async function handleAuthChange(user) {
   state.user = user || null;
+  state.authKnown = true;
   updateAuthUI();
 
   if (user) {
-    // Start cloud sync
-    startCloudSync();
-    // Push any local trips that don't have ownerUid
-    migrateLocalToCloud();
-  } else {
-    stopCloudSync();
-  }
+    // We're signed in — go to trips view (from login gate or wherever)
+    state.offlineMode = false;
+    state.syncingInitial = true;
+    state.gotOwnedSnap = false;
+    state.gotCollabSnap = false;
 
-  renderTripsList();
-  if (state.currentTripId) renderTripDetail();
+    // Show trips view immediately with syncing placeholder if empty
+    if (state.currentView === 'login') switchView('trips');
+
+    // Start cloud sync BEFORE migration so listeners are live
+    startCloudSync();
+    // Push local trips that don't have ownerUid (first-run only)
+    await migrateLocalToCloud();
+    renderTripsList();
+  } else {
+    // Signed out — clear local + cloud subs + gate
+    stopCloudSync();
+    await clearLocalDataForSignOut();
+    if (!state.offlineMode) {
+      switchView('login');
+    }
+    renderTripsList();
+  }
+}
+
+/**
+ * Nuke local IDB stores so previous user's trips don't leak visually
+ * to the sign-in screen or to the next user on this device.
+ */
+async function clearLocalDataForSignOut() {
+  try {
+    const stores = [STORE_TRIPS, STORE_ACTIVITIES, STORE_STAYS, STORE_IDEAS];
+    for (const s of stores) {
+      await reqP(tx(s, 'readwrite').clear());
+    }
+    // Note: we keep attachments (they're local-only anyway).
+    // Keep META too (theme etc).
+  } catch (e) { console.warn('Local clear failed:', e); }
 }
 
 function updateAuthUI() {
@@ -299,13 +340,15 @@ function updateAuthUI() {
   const label = document.getElementById('auth-label');
   const prompt = document.getElementById('signin-prompt');
 
-  if (!isFirebaseConfigured()) {
+  // Never show chip on login screen
+  if (state.currentView === 'login') {
+    chip.classList.add('hidden');
+  } else if (!isFirebaseConfigured()) {
     chip.classList.add('hidden');
     prompt.classList.add('hidden');
-    return;
+  } else {
+    chip.classList.remove('hidden');
   }
-
-  chip.classList.remove('hidden');
 
   if (state.user) {
     prompt.classList.add('hidden');
@@ -318,9 +361,16 @@ function updateAuthUI() {
     } else {
       avatar.textContent = initials;
     }
-    label.textContent = 'Sign out';
+    label.textContent = state.user.email
+      ? state.user.email.split('@')[0]
+      : 'Signed in';
   } else {
-    prompt.classList.remove('hidden');
+    // Offline mode → show the "not signed in" banner on trips page
+    if (state.offlineMode && isFirebaseConfigured()) {
+      prompt.classList.remove('hidden');
+    } else {
+      prompt.classList.add('hidden');
+    }
     dot.classList.add('offline');
     dot.title = 'Signed out — local only';
     avatar.textContent = '?';
@@ -346,8 +396,14 @@ async function signIn() {
   }
 }
 async function signOut() {
-  await state.auth.signOut();
-  toast('Signed out', 'success');
+  try {
+    await state.auth.signOut();
+    // handleAuthChange will clear local data and gate to login
+    toast('Signed out', 'success');
+  } catch (err) {
+    console.error(err);
+    toast('Sign-out failed', 'error');
+  }
 }
 
 /* =============================================================
@@ -371,11 +427,10 @@ function startCloudSync() {
   const email = (state.user.email || '').toLowerCase();
 
   // Two queries: trips I own, and trips I collaborate on.
-  // Merged via onSnapshot listeners for each.
   const ownedQ = tripsCol().where('ownerUid', '==', state.user.uid);
-  const collabQ = tripsCol().where('collaborators', 'array-contains', email);
+  const collabQ = email ? tripsCol().where('collaborators', 'array-contains', email) : null;
 
-  const handleSnap = async (snap) => {
+  const applySnap = async (snap) => {
     for (const ch of snap.docChanges()) {
       const data = ch.doc.data();
       data.id = Number(ch.doc.id);
@@ -391,13 +446,47 @@ function startCloudSync() {
         }
       }
     }
+    // Subscribe to child collections whenever the trip set changes
+    subscribeToAllTripChildren();
     renderTripsList();
     if (state.currentTripId) renderTripDetail();
-    subscribeToAllTripChildren();
   };
 
-  const unsubOwned = ownedQ.onSnapshot(handleSnap, err => console.warn('Owned trips sync error:', err));
-  const unsubCollab = collabQ.onSnapshot(handleSnap, err => console.warn('Collab trips sync error:', err));
+  const maybeClearSyncing = () => {
+    if (state.gotOwnedSnap && (state.gotCollabSnap || !collabQ)) {
+      state.syncingInitial = false;
+      renderTripsList();
+    }
+  };
+
+  const unsubOwned = ownedQ.onSnapshot(async snap => {
+    await applySnap(snap);
+    state.gotOwnedSnap = true;
+    maybeClearSyncing();
+  }, err => {
+    console.warn('Owned trips sync error:', err);
+    state.gotOwnedSnap = true;
+    maybeClearSyncing();
+    if (err && err.code === 'permission-denied') {
+      toast('Cloud rules block reads. Update Firestore rules per README.', 'error');
+    }
+  });
+
+  let unsubCollab = () => {};
+  if (collabQ) {
+    unsubCollab = collabQ.onSnapshot(async snap => {
+      await applySnap(snap);
+      state.gotCollabSnap = true;
+      maybeClearSyncing();
+    }, err => {
+      console.warn('Collab trips sync error:', err);
+      state.gotCollabSnap = true;
+      maybeClearSyncing();
+    });
+  } else {
+    state.gotCollabSnap = true;
+  }
+
   state.unsubTrips = () => { unsubOwned(); unsubCollab(); };
 }
 
@@ -693,20 +782,39 @@ function updateThemeIcon() {
 function switchView(view) {
   state.currentView = view;
   document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
-  document.getElementById('view-' + view).classList.add('active');
+  const el = document.getElementById('view-' + view);
+  if (el) el.classList.add('active');
 
   const backBtn = document.getElementById('back-btn');
   const title = document.getElementById('header-title');
+  const header = document.querySelector('.app-header');
+  const themeBtn = document.getElementById('theme-toggle');
+  const authChip = document.getElementById('auth-chip');
 
-  if (view === 'trips') {
+  // Login: hide most chrome
+  if (view === 'login') {
     backBtn.classList.add('hidden');
     title.textContent = 'Itinerary';
+    if (authChip) authChip.classList.add('hidden');
+    if (themeBtn) themeBtn.classList.remove('hidden');
+    // Ensure no other view is showing trip data
+    updateAuthUI();
+  } else if (view === 'trips') {
+    backBtn.classList.add('hidden');
+    title.textContent = 'Itinerary';
+    if (authChip && (state.firebaseReady || state.user)) authChip.classList.remove('hidden');
   } else if (view === 'trip-detail') {
     backBtn.classList.remove('hidden');
     title.textContent = 'Trip';
-  } else if (view === 'activity-form') {
+    if (authChip && (state.firebaseReady || state.user)) authChip.classList.remove('hidden');
+  } else if (view === 'activity-form' || view === 'stay-form' || view === 'idea-form') {
     backBtn.classList.remove('hidden');
-    title.textContent = state.editingActivityId ? 'Edit Activity' : 'New Activity';
+    title.textContent = view === 'activity-form'
+      ? (state.editingActivityId ? 'Edit Activity' : 'New Activity')
+      : view === 'stay-form'
+        ? (state.editingStayId ? 'Edit Stay' : 'New Stay')
+        : (state.editingIdeaId ? 'Edit Idea' : 'New Idea');
+    if (authChip && (state.firebaseReady || state.user)) authChip.classList.remove('hidden');
   }
 
   window.scrollTo({ top: 0, behavior: 'auto' });
@@ -734,13 +842,22 @@ async function renderTripsList() {
 
   const grid = document.getElementById('trips-grid');
   const empty = document.getElementById('trips-empty');
+  const syncing = document.getElementById('trips-syncing');
 
   if (!trips.length) {
     grid.innerHTML = '';
-    empty.classList.remove('hidden');
+    // Signed in and still awaiting first snapshot? Show syncing.
+    if (state.user && state.syncingInitial) {
+      empty.classList.add('hidden');
+      syncing.classList.remove('hidden');
+    } else {
+      syncing.classList.add('hidden');
+      empty.classList.remove('hidden');
+    }
     return;
   }
   empty.classList.add('hidden');
+  syncing.classList.add('hidden');
 
   const cards = await Promise.all(trips.map(async trip => {
     const acts = await getActivitiesByTrip(trip.id);
@@ -2652,6 +2769,15 @@ function registerSW() {
  * EVENT WIRING
  * ============================================================= */
 function wireEvents() {
+  // === Login gate ===
+  document.getElementById('login-google-btn').addEventListener('click', signIn);
+  document.getElementById('login-local-btn').addEventListener('click', () => {
+    state.offlineMode = true;
+    switchView('trips');
+    renderTripsList();
+    toast('Continuing offline — no sync.', '');
+  });
+
   // Back button — assigned as .onclick further below to allow overriding
 
 
@@ -2661,8 +2787,17 @@ function wireEvents() {
 
   // Auth
   document.getElementById('auth-chip').addEventListener('click', () => {
-    if (!state.firebaseReady) return;
-    if (state.user) signOut(); else signIn();
+    if (!state.firebaseReady) {
+      switchView('login');
+      return;
+    }
+    if (state.user) {
+      if (confirm('Sign out? Your local view of trips will be cleared until you sign in again.')) {
+        signOut();
+      }
+    } else {
+      switchView('login');
+    }
   });
   document.getElementById('signin-prompt-btn').addEventListener('click', signIn);
 
@@ -2880,9 +3015,22 @@ async function init() {
     return;
   }
   wireEvents();
-  await renderTripsList();
+
+  // Show login gate by default
+  switchView('login');
+
+  // If Firebase is configured, wait for auth. Otherwise let user proceed offline.
   await initFirebase();
   updateAuthUI();
+
+  // If Firebase isn't configured, we still allow local mode via "Continue offline"
+  // (default behaviour). Auto-enter trips view since there's no auth to wait for.
+  if (!isFirebaseConfigured()) {
+    // No sign-in possible — go straight to trips (local-only mode)
+    // BUT keep login screen visible until user clicks Continue offline
+    // (so they see the warning). If we didn't show config warn, this is a bug.
+  }
+
   registerSW();
   setupInstallPrompt();
 }

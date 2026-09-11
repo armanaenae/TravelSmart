@@ -3,6 +3,7 @@
 An offline-first Progressive Web App for planning travel itineraries. Sync your trips across all your devices with a free Google sign-in.
 
 **Features**
+- 🔐 **Login gate** — you sign in with Google before you see anything, so you always know which account you're on
 - ✈️ Trips + activities with day/time scheduling, cost, travel time
 - 🏨 **Stays tab** — hotels & lodging entered once, auto-populated on every night of the schedule
 - 💡 **Ideas tab** — parking lot for places you might visit; promote to a specific day when ready
