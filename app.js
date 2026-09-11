@@ -3296,10 +3296,8 @@ async function runRulesHealthCheck() {
   }
 
   await check('Read joinCodes lookup collection', async () => {
-    // Try reading a bogus code — should fail-not-found, not permission-denied
-    const s = await state.firestore.collection('joinCodes').doc('__healthcheck__').get({ source: 'server' });
-    // getting a non-existent doc returns exists=false without error
-    if (!s.exists) return;
+    // Try reading a bogus code — should return not-exists (no error) if rules OK.
+    await state.firestore.collection('joinCodes').doc('HEALTHCHECK').get({ source: 'server' });
   });
 
   const summary = results.join('\n');

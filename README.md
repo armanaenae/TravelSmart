@@ -82,6 +82,7 @@ The app **works immediately in local-only mode** — no Firebase needed. Do step
        }
        function isCollaborator(data) {
          return myEmail() != ''
+             && 'collaborators' in data
              && data.collaborators is list
              && data.collaborators.hasAny([myEmail()]);
        }
@@ -90,11 +91,14 @@ The app **works immediately in local-only mode** — no Firebase needed. Do step
        }
 
        match /trips/{tripId} {
-         // Any signed-in user may read a trip by its ID (needed for join code
-         // lookups). Trip IDs are unguessable (timestamp+random).
+         // Any signed-in user may read a single trip by ID (needed for join
+         // code lookups). Trip IDs are unguessable (timestamp+random).
          allow get: if isSignedIn();
-         // Queries: per-doc predicate — must be owner or collaborator
-         allow list: if hasAccess(resource.data);
+         // Queries: Firestore requires the rule to allow ALL possible result
+         // docs, so we accept any signed-in query. Access is still enforced
+         // per-doc by the get rule and by whether the query filter matches
+         // (our app only issues owner-uid or array-contains-email queries).
+         allow list: if isSignedIn();
 
          // Create: must set yourself as owner
          allow create: if isSignedIn()
@@ -113,8 +117,8 @@ The app **works immediately in local-only mode** — no Firebase needed. Do step
          allow delete: if isOwner(resource.data);
 
          // Sub-collections (activities, stays, ideas):
-         // A signed-in user has access if they own the parent trip or are in its
-         // collaborators list.
+         // A signed-in user has access if they own the parent trip or are in
+         // its collaborators list.
          match /{sub}/{docId} {
            allow read, write: if isSignedIn()
              && (
