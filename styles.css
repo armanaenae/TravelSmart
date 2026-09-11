@@ -1664,6 +1664,36 @@ html[data-theme="dark"] .form-group select {
 .login-features .lf-item strong { font-weight: 600; color: var(--text); font-size: 13.5px; display: block; margin-bottom: 2px; }
 .login-features .lf-item .subtle { font-size: 12.5px; line-height: 1.4; }
 
+/* Sync debug panel */
+.sync-debug {
+  position: fixed;
+  bottom: calc(16px + var(--safe-bottom));
+  right: max(16px, var(--safe-right));
+  left: max(16px, var(--safe-left));
+  max-width: 480px;
+  margin: 0 auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
+  box-shadow: var(--shadow-lg);
+  z-index: 200;
+  font-size: 12px;
+}
+.sync-debug pre {
+  margin: 0 0 10px;
+  max-height: 240px;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  background: var(--surface-2);
+  padding: 8px;
+  border-radius: var(--radius-xs);
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.5;
+}
+
 /* Spinner */
 .spinner {
   width: 32px;

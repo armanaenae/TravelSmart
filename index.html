@@ -293,6 +293,13 @@
               <button id="join-code-revoke" class="btn btn-danger-ghost btn-sm hidden" type="button">Revoke code</button>
             </div>
           </div>
+
+          <div class="section-title" style="margin-top:24px"><h3>Sync Diagnostics</h3></div>
+          <p class="help subtle" style="font-size:13px;margin-bottom:10px">If collaborators don't see updates, click below to check what's stored and force a fresh pull from the cloud.</p>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button id="show-sync-debug-btn" class="btn btn-ghost btn-sm" type="button">Show sync status</button>
+            <button id="force-sync-btn" class="btn btn-primary btn-sm" type="button">🔄 Force refresh from cloud</button>
+          </div>
         </div>
       </div>
     </section>
@@ -650,6 +657,16 @@
 
   <!-- ============ TOAST ============ -->
   <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+  <!-- ============ SYNC DEBUG PANEL (long-press auth chip to toggle) ============ -->
+  <div id="sync-debug" class="sync-debug hidden">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+      <strong>Sync status</strong>
+      <button id="sync-debug-close" class="btn btn-ghost btn-sm">✕</button>
+    </div>
+    <pre id="sync-debug-content"></pre>
+    <button id="sync-debug-refresh" class="btn btn-primary btn-sm">Force refresh from cloud</button>
+  </div>
 
   <!-- ============ INSTALL BANNER ============ -->
   <div id="install-banner" class="install-banner hidden">

@@ -433,10 +433,12 @@ function startCloudSync() {
   stopCloudSync();
 
   const email = (state.user.email || '').toLowerCase();
+  console.log('[sync] Starting cloud sync for:', { uid: state.user.uid, email });
 
   // Two queries: trips I own, and trips I collaborate on.
   const ownedQ = tripsCol().where('ownerUid', '==', state.user.uid);
   const collabQ = email ? tripsCol().where('collaborators', 'array-contains', email) : null;
+  if (!collabQ) console.warn('[sync] No email on account — collab trips will not sync!');
 
   const applySnap = async (snap) => {
     for (const ch of snap.docChanges()) {
@@ -517,6 +519,7 @@ async function subscribeToAllTripChildren() {
 
   const trips = await getAllTrips();
   const wanted = new Set(trips.map(t => String(t.id)));
+  console.log('[sync] subscribeToAllTripChildren, trips:', trips.map(t => ({ id: t.id, name: t.name, ownerUid: t.ownerUid, isMine: t.ownerUid === state.user.uid })));
 
   // Unsubscribe stale
   ['unsubActs', 'unsubStays', 'unsubIdeas'].forEach(k => {
@@ -630,36 +633,63 @@ async function syncActivityUp(a) {
     const clean = { ...a };
     delete clean._fromCloud;
     await actsCol(a.tripId).doc(String(a.id)).set(clean, { merge: true });
-  } catch (err) { console.warn('Activity upload failed:', err); }
+    try { await state.firestore.waitForPendingWrites(); } catch (e) { console.warn('Activity write not confirmed by server:', e); }
+  } catch (err) {
+    console.error('[sync] Activity upload FAILED:', err);
+    toast('Activity did not sync: ' + (err.code || err.message), 'error');
+  }
 }
 async function deleteActivityCloud(tripId, actId) {
   if (!state.user) return;
-  try { await actsCol(tripId).doc(String(actId)).delete(); }
-  catch (err) { console.warn('Activity cloud delete failed:', err); }
+  try {
+    await actsCol(tripId).doc(String(actId)).delete();
+    try { await state.firestore.waitForPendingWrites(); } catch (e) { console.warn('Delete not confirmed:', e); }
+  } catch (err) {
+    console.error('[sync] Activity delete FAILED:', err);
+    toast('Delete did not sync: ' + (err.code || err.message), 'error');
+  }
 }
 async function syncStayUp(s) {
   if (!state.user) return;
   try {
     const clean = { ...s }; delete clean._fromCloud;
     await staysCol(s.tripId).doc(String(s.id)).set(clean, { merge: true });
-  } catch (err) { console.warn('Stay upload failed:', err); }
+    try { await state.firestore.waitForPendingWrites(); } catch (e) { console.warn('Stay write not confirmed:', e); }
+  } catch (err) {
+    console.error('[sync] Stay upload FAILED:', err);
+    toast('Stay did not sync: ' + (err.code || err.message), 'error');
+  }
 }
 async function deleteStayCloud(tripId, stayId) {
   if (!state.user) return;
-  try { await staysCol(tripId).doc(String(stayId)).delete(); }
-  catch (err) { console.warn('Stay cloud delete failed:', err); }
+  try {
+    await staysCol(tripId).doc(String(stayId)).delete();
+    try { await state.firestore.waitForPendingWrites(); } catch (e) { console.warn('Stay delete not confirmed:', e); }
+  } catch (err) {
+    console.error('[sync] Stay delete FAILED:', err);
+    toast('Delete did not sync: ' + (err.code || err.message), 'error');
+  }
 }
 async function syncIdeaUp(i) {
   if (!state.user) return;
   try {
     const clean = { ...i }; delete clean._fromCloud;
     await ideasCol(i.tripId).doc(String(i.id)).set(clean, { merge: true });
-  } catch (err) { console.warn('Idea upload failed:', err); }
+    try { await state.firestore.waitForPendingWrites(); } catch (e) { console.warn('Idea write not confirmed:', e); }
+  } catch (err) {
+    console.error('[sync] Idea upload FAILED:', err);
+    toast('Idea did not sync: ' + (err.code || err.message), 'error');
+  }
 }
 async function deleteIdeaCloud(tripId, ideaId) {
   if (!state.user) return;
-  try { await ideasCol(tripId).doc(String(ideaId)).delete(); }
-  catch (err) { console.warn('Idea cloud delete failed:', err); }
+  try {
+    await ideasCol(tripId).doc(String(ideaId)).delete();
+    try { await state.firestore.waitForPendingWrites(); } catch (e) { console.warn('Idea delete not confirmed:', e); }
+  } catch (err) {
+    console.error('[sync] Idea delete FAILED:', err);
+    toast('Delete did not sync: ' + (err.code || err.message), 'error');
+  }
 }
 
 async function migrateLocalToCloud() {
@@ -1788,6 +1818,20 @@ async function handleJoinByCode(e) {
     });
     try { await state.firestore.waitForPendingWrites(); } catch (e) {}
 
+    // Verify the write actually landed by reading the trip from the server
+    try {
+      const verify = await tripDoc(tripId).get({ source: 'server' });
+      const collabs = (verify.data() && verify.data().collaborators) || [];
+      const iAmThere = collabs.map(x => String(x).toLowerCase()).includes(myEmail);
+      console.log('[join] Post-write verify:', { collabs, iAmThere });
+      if (!iAmThere) {
+        toast('Join looked successful but the server did not save your email. Rules may still be blocking. Ask the owner to re-check Firestore rules.', 'error');
+        return;
+      }
+    } catch (e) {
+      console.warn('[join] Verify failed:', e);
+    }
+
     toast(`Joined "${tripData.name}"!`, 'success');
     hideJoinPanel();
     // Seed the trip into local IDB so the detail view can render immediately,
@@ -1796,11 +1840,20 @@ async function handleJoinByCode(e) {
       ...tripData,
       id: tripId,
       collaborators: newCollabs,
-      _fromCloud: true,
     };
-    delete seed._fromCloud;  // treat as owned locally
     await reqP(tx(STORE_TRIPS, 'readwrite').put({ ...seed, updatedAt: Date.now() }));
+
+    // CRITICAL: subscribe to this trip's child collections (activities, stays, ideas)
+    // so we get their content. The trips-list collab listener will pick up further
+    // updates to the trip doc itself.
+    await subscribeToAllTripChildren();
+
     state.currentTripId = tripId;
+    // Restart the trips listeners so the collab query picks up this new trip
+    // (Firestore's array-contains query re-evaluates on every snapshot, but
+    // being explicit here removes any doubt).
+    startCloudSync();
+
     setTimeout(() => {
       switchView('trip-detail');
       switchTab('schedule');
@@ -3047,6 +3100,118 @@ async function handleImportTrips(file) {
 }
 
 /* =============================================================
+ * SYNC DEBUG PANEL
+ * ============================================================= */
+async function showSyncDebug() {
+  const panel = document.getElementById('sync-debug');
+  const content = document.getElementById('sync-debug-content');
+
+  const info = {
+    'Signed in as': state.user ? state.user.email : '(signed out)',
+    'User UID': state.user ? state.user.uid : '—',
+    'Firebase ready': state.firebaseReady,
+    'Offline mode': state.offlineMode,
+    'Initial sync in progress': state.syncingInitial,
+  };
+
+  const trips = await getAllTrips();
+  info['Local trips count'] = trips.length;
+
+  const details = [];
+  for (const t of trips) {
+    const isMine = state.user && t.ownerUid === state.user.uid;
+    const collabs = Array.isArray(t.collaborators) ? t.collaborators : [];
+    const myEmail = (state.user?.email || '').toLowerCase();
+    const isCollab = state.user && collabs.map(x => String(x).toLowerCase()).includes(myEmail);
+    const acts = await getActivitiesByTrip(t.id);
+    const stays = await getStaysByTrip(t.id);
+    details.push({
+      id: t.id,
+      name: t.name,
+      role: isMine ? 'owner' : (isCollab ? 'collaborator' : 'unknown'),
+      ownerUid: t.ownerUid || '(none)',
+      ownerEmail: t.ownerEmail || '(none)',
+      collaborators: collabs,
+      joinCode: t.joinCode || null,
+      updatedAt: t.updatedAt ? new Date(t.updatedAt).toISOString() : '—',
+      activities: acts.length,
+      stays: stays.length,
+    });
+  }
+
+  let text = '';
+  Object.entries(info).forEach(([k, v]) => { text += `${k}: ${v}\n`; });
+  text += '\n--- Trips ---\n' + JSON.stringify(details, null, 2);
+
+  content.textContent = text;
+  panel.classList.remove('hidden');
+}
+
+function hideSyncDebug() {
+  document.getElementById('sync-debug').classList.add('hidden');
+}
+
+async function forceRefreshFromCloud() {
+  if (!state.user || !state.firebaseReady) {
+    toast('Sign in first', 'error');
+    return;
+  }
+  toast('Refreshing from cloud…');
+  try {
+    await reqP(tx(STORE_TRIPS, 'readwrite').clear());
+    await reqP(tx(STORE_ACTIVITIES, 'readwrite').clear());
+    await reqP(tx(STORE_STAYS, 'readwrite').clear());
+    await reqP(tx(STORE_IDEAS, 'readwrite').clear());
+    stopCloudSync();
+
+    const email = (state.user.email || '').toLowerCase();
+    const [ownedSnap, collabSnap] = await Promise.all([
+      tripsCol().where('ownerUid', '==', state.user.uid).get({ source: 'server' }),
+      email ? tripsCol().where('collaborators', 'array-contains', email).get({ source: 'server' }) : Promise.resolve({ docs: [] }),
+    ]);
+    const seen = new Set();
+    const allDocs = [];
+    [...ownedSnap.docs, ...collabSnap.docs].forEach(d => {
+      if (!seen.has(d.id)) { seen.add(d.id); allDocs.push(d); }
+    });
+    console.log('[refresh] Fetched trips from server:', allDocs.length);
+
+    for (const doc of allDocs) {
+      const data = doc.data();
+      data.id = Number(doc.id);
+      await reqP(tx(STORE_TRIPS, 'readwrite').put(data));
+
+      const [aSnap, sSnap, iSnap] = await Promise.all([
+        actsCol(data.id).get({ source: 'server' }),
+        staysCol(data.id).get({ source: 'server' }),
+        ideasCol(data.id).get({ source: 'server' }),
+      ]);
+      for (const d of aSnap.docs) {
+        const x = d.data(); x.id = Number(d.id); x.tripId = data.id;
+        await reqP(tx(STORE_ACTIVITIES, 'readwrite').put(x));
+      }
+      for (const d of sSnap.docs) {
+        const x = d.data(); x.id = Number(d.id); x.tripId = data.id;
+        await reqP(tx(STORE_STAYS, 'readwrite').put(x));
+      }
+      for (const d of iSnap.docs) {
+        const x = d.data(); x.id = Number(d.id); x.tripId = data.id;
+        await reqP(tx(STORE_IDEAS, 'readwrite').put(x));
+      }
+    }
+
+    startCloudSync();
+    await renderTripsList();
+    if (state.currentTripId) await renderTripDetail();
+    toast(`Loaded ${allDocs.length} trips from cloud`, 'success');
+    await showSyncDebug();
+  } catch (err) {
+    console.error(err);
+    toast('Refresh failed: ' + (err.code || err.message), 'error');
+  }
+}
+
+/* =============================================================
  * INSTALL PROMPT
  * ============================================================= */
 let deferredInstallPrompt = null;
@@ -3321,6 +3486,12 @@ function wireEvents() {
   document.getElementById('join-code-revoke').addEventListener('click', handleRevokeJoinCode);
   document.getElementById('join-code-copy').addEventListener('click', handleCopyJoinCode);
   document.getElementById('join-code-share').addEventListener('click', handleShareJoinCode);
+
+  // Sync diagnostics
+  document.getElementById('show-sync-debug-btn').addEventListener('click', showSyncDebug);
+  document.getElementById('force-sync-btn').addEventListener('click', forceRefreshFromCloud);
+  document.getElementById('sync-debug-close').addEventListener('click', hideSyncDebug);
+  document.getElementById('sync-debug-refresh').addEventListener('click', forceRefreshFromCloud);
 
   // Join by code (trips screen)
   document.getElementById('show-join-btn').addEventListener('click', showJoinPanel);
