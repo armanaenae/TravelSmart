@@ -1739,6 +1739,8 @@ async function handleJoinByCode(e) {
       return;
     }
     const tripData = tripSnap.data();
+    const myEmail = (state.user.email || '').toLowerCase();
+    if (!myEmail) { toast('No email on account', 'error'); return; }
 
     console.log('[join] Trip data:', {
       name: tripData.name, joinCode: tripData.joinCode,
@@ -1754,9 +1756,6 @@ async function handleJoinByCode(e) {
       toast(`Code mismatch — trip says "${tripData.joinCode}" but you typed "${raw}". Ask the owner for the current code.`, 'error');
       return;
     }
-
-    const myEmail = (state.user.email || '').toLowerCase();
-    if (!myEmail) { toast('No email on account', 'error'); return; }
 
     // 3) If already the owner or collaborator, deep-link
     if (tripData.ownerUid === state.user.uid
