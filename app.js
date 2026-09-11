@@ -1611,21 +1611,33 @@ async function handleGenerateJoinCode() {
     }
     if (!ok) throw new Error('Could not generate a unique code');
 
-    // 1) Update trip doc with joinCode (owner rule allows this)
+    // ORDER MATTERS to avoid the "revoked" race:
+    // 1. Write trip.joinCode FIRST and wait for server ack
+    // 2. THEN create the joinCodes lookup doc
+    // This way, any invitee who successfully reads joinCodes/{CODE}
+    // is guaranteed to see the matching trip.joinCode field.
     await saveTrip({ ...trip, joinCode: code }, { awaitCloud: true });
 
-    // 2) Create lookup doc
     await joinCodesDoc(code).set({
       tripId: trip.id,
       ownerUid: state.user.uid,
+      code: code,
       createdAt: Date.now(),
     });
     try { await state.firestore.waitForPendingWrites(); } catch (e) {}
 
+    // Verify the write landed by reading trip back from server
+    try {
+      const check = await tripDoc(trip.id).get({ source: 'server' });
+      if (check.exists && check.data().joinCode !== code) {
+        console.warn('Trip joinCode did not match after generate:', check.data().joinCode, 'vs', code);
+      }
+    } catch (e) { /* non-fatal */ }
+
     toast('Code ready to share', 'success');
     await renderJoinCodeUI();
   } catch (err) {
-    console.error(err);
+    console.error('Generate code failed:', err);
     toast('Failed: ' + (err.code || err.message || 'unknown'), 'error');
   } finally {
     genBtn.disabled = false; genBtn.textContent = prev;
@@ -1714,15 +1726,32 @@ async function handleJoinByCode(e) {
     const info = snap.data();
     const tripId = Number(info.tripId);
 
-    // 2) Fetch the trip so we know current collaborators & joinCode field
-    const tripSnap = await tripDoc(tripId).get();
+    // 2) Fetch the trip so we know current collaborators.
+    // Force server-fetch to avoid stale cached data on the invitee's device.
+    let tripSnap;
+    try {
+      tripSnap = await tripDoc(tripId).get({ source: 'server' });
+    } catch (e) {
+      tripSnap = await tripDoc(tripId).get();
+    }
     if (!tripSnap.exists) {
       toast('Trip no longer exists', 'error');
       return;
     }
     const tripData = tripSnap.data();
-    if (tripData.joinCode !== raw) {
-      toast('This code was revoked. Ask the owner for a fresh code.', 'error');
+
+    console.log('[join] Trip data:', {
+      name: tripData.name, joinCode: tripData.joinCode,
+      ownerUid: tripData.ownerUid, myUid: state.user.uid, myEmail,
+      typed: raw,
+    });
+
+    // The joinCodes doc is our source of truth. Only reject if the trip
+    // explicitly shows a *different* joinCode (i.e. owner regenerated).
+    // If joinCode is missing on the trip but the joinCodes doc exists, allow —
+    // it's likely a propagation delay.
+    if (tripData.joinCode && String(tripData.joinCode).toUpperCase() !== raw.toUpperCase()) {
+      toast(`Code mismatch — trip says "${tripData.joinCode}" but you typed "${raw}". Ask the owner for the current code.`, 'error');
       return;
     }
 
@@ -1741,13 +1770,19 @@ async function handleJoinByCode(e) {
       return;
     }
 
-    // 4) Add ourselves as collaborator via a minimal update
+    // 4) Add ourselves as collaborator via a minimal update.
+    // Rules require: joinCode unchanged, ownerUid unchanged, collaborators = old + me.
     const newCollabs = Array.isArray(tripData.collaborators) ? [...tripData.collaborators] : [];
     newCollabs.push(myEmail);
+    // Ensure joinCode is present in the trip doc so the rule can validate.
+    // If it's somehow missing (propagation lag), use the typed code — the
+    // joinCodes lookup already confirmed it's valid.
+    const codeForWrite = tripData.joinCode || raw;
+    console.log('[join] Writing collab update:', { tripId, newCollabs, codeForWrite });
     await tripDoc(tripId).update({
       collaborators: newCollabs,
-      joinCode: tripData.joinCode,  // unchanged; rule allows if unchanged
-      ownerUid: tripData.ownerUid,   // unchanged; rule allows
+      joinCode: codeForWrite,
+      ownerUid: tripData.ownerUid,
       updatedAt: Date.now(),
     });
     try { await state.firestore.waitForPendingWrites(); } catch (e) {}

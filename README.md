@@ -93,9 +93,9 @@ The app **works immediately in local-only mode** — no Firebase needed. Do step
 
        // A signed-in user is joining themselves via a valid joinCode.
        // Allowed only if:
-       //   - the trip currently has a joinCode
-       //   - joinCode + ownerUid are unchanged in this write
-       //   - the new collaborators list is old + their own email (nothing else)
+       //   - trip has a joinCode string, unchanged in this write
+       //   - ownerUid unchanged
+       //   - collaborators list is old-list + their own email (no other change)
        function isSelfJoinViaCode() {
          return isSignedIn()
            && myEmail() != ''
