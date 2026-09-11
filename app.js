@@ -1619,7 +1619,9 @@ async function handleGenerateJoinCode() {
     await saveTrip({ ...trip, joinCode: code }, { awaitCloud: true });
 
     await joinCodesDoc(code).set({
-      tripId: trip.id,
+      // Store as string so Firestore rules can compare against the trip's doc ID
+      // (which is always a string in rule context).
+      tripId: String(trip.id),
       ownerUid: state.user.uid,
       code: code,
       createdAt: Date.now(),

@@ -92,23 +92,32 @@ The app **works immediately in local-only mode** — no Firebase needed. Do step
        }
 
        // A signed-in user is joining themselves via a valid joinCode.
+       //
+       // Source of truth = the `joinCodes/{code}` doc: it exists only if the
+       // owner minted a code and points back to this trip. The trip's own
+       // `joinCode` field is just for display and may lag due to propagation.
+       //
        // Allowed only if:
-       //   - trip has a joinCode string, unchanged in this write
        //   - ownerUid unchanged
-       //   - collaborators list is old-list + their own email (no other change)
-       function isSelfJoinViaCode() {
+       //   - collaborators = old + exactly this user's email (no other change)
+       //   - the code they're writing (as `joinCode` field) has a matching
+       //     `joinCodes/{code}` doc that references this same trip
+       function isSelfJoinViaCode(tripId) {
          return isSignedIn()
            && myEmail() != ''
-           && resource.data.joinCode is string
-           && request.resource.data.joinCode == resource.data.joinCode
            && request.resource.data.ownerUid == resource.data.ownerUid
            && request.resource.data.collaborators is list
+           && (myEmail() in request.resource.data.collaborators)
            && (resource.data.collaborators == null
                || !(myEmail() in resource.data.collaborators))
-           && (myEmail() in request.resource.data.collaborators)
            && request.resource.data.collaborators.hasAll(
                 resource.data.collaborators == null ? [] : resource.data.collaborators
-              );
+              )
+           && request.resource.data.collaborators.size() ==
+                (resource.data.collaborators == null ? 0 : resource.data.collaborators.size()) + 1
+           && request.resource.data.joinCode is string
+           && exists(/databases/$(database)/documents/joinCodes/$(request.resource.data.joinCode))
+           && get(/databases/$(database)/documents/joinCodes/$(request.resource.data.joinCode)).data.tripId == tripId;
        }
 
        match /trips/{tripId} {
@@ -123,7 +132,7 @@ The app **works immediately in local-only mode** — no Firebase needed. Do step
          allow create: if isSignedIn()
                        && request.resource.data.ownerUid == request.auth.uid;
          // Update: owner OR collaborator (full edit) OR self-joining via code
-         allow update: if hasAccess(resource.data) || isSelfJoinViaCode();
+         allow update: if hasAccess(resource.data) || isSelfJoinViaCode(tripId);
          // Delete: owner only
          allow delete: if isOwner(resource.data);
 
