@@ -315,6 +315,14 @@ async function handleAuthChange(user) {
     // Push local trips that don't have ownerUid (first-run only)
     await migrateLocalToCloud();
     renderTripsList();
+
+    // Also force one authoritative server refresh on sign-in.
+    // This guarantees we're never showing stale cached data at start.
+    setTimeout(async () => {
+      try {
+        await forceRefreshFromCloudQuiet();
+      } catch (e) { /* handled inside */ }
+    }, 800);
   } else {
     // Signed out — clear local + cloud subs + gate
     stopCloudSync();
@@ -604,6 +612,10 @@ async function syncTripUp(trip) {
     delete clean._fromCloud;
     if (!clean.ownerUid) clean.ownerUid = state.user.uid;
     if (!Array.isArray(clean.collaborators)) clean.collaborators = [];
+    // Stamp ownerEmail if this user is the owner — so collaborators can see who owns it
+    if (clean.ownerUid === state.user.uid && state.user.email) {
+      clean.ownerEmail = state.user.email.toLowerCase();
+    }
     await tripDoc(trip.id).set(clean, { merge: true });
     // With offline persistence enabled, set() resolves once the write is queued
     // locally, NOT once the server has acked. If we sign out immediately after
@@ -834,22 +846,27 @@ function switchView(view) {
   const themeBtn = document.getElementById('theme-toggle');
   const authChip = document.getElementById('auth-chip');
 
+  const refreshBtn = document.getElementById('refresh-btn');
+
   // Login: hide most chrome
   if (view === 'login') {
     backBtn.classList.add('hidden');
     title.textContent = 'Itinerary';
     if (authChip) authChip.classList.add('hidden');
     if (themeBtn) themeBtn.classList.remove('hidden');
+    if (refreshBtn) refreshBtn.classList.add('hidden');
     // Ensure no other view is showing trip data
     updateAuthUI();
   } else if (view === 'trips') {
     backBtn.classList.add('hidden');
     title.textContent = 'Itinerary';
     if (authChip && (state.firebaseReady || state.user)) authChip.classList.remove('hidden');
+    if (refreshBtn && state.user) refreshBtn.classList.remove('hidden');
   } else if (view === 'trip-detail') {
     backBtn.classList.remove('hidden');
     title.textContent = 'Trip';
     if (authChip && (state.firebaseReady || state.user)) authChip.classList.remove('hidden');
+    if (refreshBtn && state.user) refreshBtn.classList.remove('hidden');
   } else if (view === 'activity-form' || view === 'stay-form' || view === 'idea-form') {
     backBtn.classList.remove('hidden');
     title.textContent = view === 'activity-form'
@@ -858,6 +875,7 @@ function switchView(view) {
         ? (state.editingStayId ? 'Edit Stay' : 'New Stay')
         : (state.editingIdeaId ? 'Edit Idea' : 'New Idea');
     if (authChip && (state.firebaseReady || state.user)) authChip.classList.remove('hidden');
+    if (refreshBtn) refreshBtn.classList.add('hidden');
   }
 
   window.scrollTo({ top: 0, behavior: 'auto' });
@@ -3151,6 +3169,88 @@ function hideSyncDebug() {
   document.getElementById('sync-debug').classList.add('hidden');
 }
 
+async function forceRefreshFromCloudQuiet() {
+  if (!state.user || !state.firebaseReady) return;
+  try {
+    const email = (state.user.email || '').toLowerCase();
+    const [ownedSnap, collabSnap] = await Promise.all([
+      tripsCol().where('ownerUid', '==', state.user.uid).get({ source: 'server' }),
+      email ? tripsCol().where('collaborators', 'array-contains', email).get({ source: 'server' }) : Promise.resolve({ docs: [] }),
+    ]);
+    const seen = new Set();
+    const allDocs = [];
+    [...ownedSnap.docs, ...collabSnap.docs].forEach(d => {
+      if (!seen.has(d.id)) { seen.add(d.id); allDocs.push(d); }
+    });
+    console.log('[refresh-quiet] Server trips:', allDocs.length);
+
+    // Delete local trips that no longer exist on server
+    const serverIds = new Set(allDocs.map(d => Number(d.id)));
+    const localTrips = await getAllTrips();
+    for (const lt of localTrips) {
+      if (!serverIds.has(lt.id)) {
+        console.log('[refresh-quiet] Removing local trip not on server:', lt.id, lt.name);
+        await reqP(tx(STORE_TRIPS, 'readwrite').delete(lt.id));
+        // Also clean children
+        const acts = await getActivitiesByTrip(lt.id);
+        for (const a of acts) await reqP(tx(STORE_ACTIVITIES, 'readwrite').delete(a.id));
+        const stays = await getStaysByTrip(lt.id);
+        for (const s of stays) await reqP(tx(STORE_STAYS, 'readwrite').delete(s.id));
+        const ideas = await getIdeasByTrip(lt.id);
+        for (const i of ideas) await reqP(tx(STORE_IDEAS, 'readwrite').delete(i.id));
+      }
+    }
+
+    for (const doc of allDocs) {
+      const data = doc.data();
+      data.id = Number(doc.id);
+      await reqP(tx(STORE_TRIPS, 'readwrite').put(data));
+
+      const [aSnap, sSnap, iSnap] = await Promise.all([
+        actsCol(data.id).get({ source: 'server' }),
+        staysCol(data.id).get({ source: 'server' }),
+        ideasCol(data.id).get({ source: 'server' }),
+      ]);
+      // Sync activities: delete missing, add/update present
+      const localActs = await getActivitiesByTrip(data.id);
+      const remoteActIds = new Set(aSnap.docs.map(d => Number(d.id)));
+      for (const la of localActs) {
+        if (!remoteActIds.has(la.id)) await reqP(tx(STORE_ACTIVITIES, 'readwrite').delete(la.id));
+      }
+      for (const d of aSnap.docs) {
+        const x = d.data(); x.id = Number(d.id); x.tripId = data.id;
+        await reqP(tx(STORE_ACTIVITIES, 'readwrite').put(x));
+      }
+      // Same for stays
+      const localStays = await getStaysByTrip(data.id);
+      const remoteStayIds = new Set(sSnap.docs.map(d => Number(d.id)));
+      for (const ls of localStays) {
+        if (!remoteStayIds.has(ls.id)) await reqP(tx(STORE_STAYS, 'readwrite').delete(ls.id));
+      }
+      for (const d of sSnap.docs) {
+        const x = d.data(); x.id = Number(d.id); x.tripId = data.id;
+        await reqP(tx(STORE_STAYS, 'readwrite').put(x));
+      }
+      // Same for ideas
+      const localIdeas = await getIdeasByTrip(data.id);
+      const remoteIdeaIds = new Set(iSnap.docs.map(d => Number(d.id)));
+      for (const li of localIdeas) {
+        if (!remoteIdeaIds.has(li.id)) await reqP(tx(STORE_IDEAS, 'readwrite').delete(li.id));
+      }
+      for (const d of iSnap.docs) {
+        const x = d.data(); x.id = Number(d.id); x.tripId = data.id;
+        await reqP(tx(STORE_IDEAS, 'readwrite').put(x));
+      }
+    }
+
+    // Trigger UI refresh
+    await renderTripsList();
+    if (state.currentTripId) await renderTripDetail();
+  } catch (err) {
+    console.warn('[refresh-quiet] failed:', err);
+  }
+}
+
 async function forceRefreshFromCloud() {
   if (!state.user || !state.firebaseReady) {
     toast('Sign in first', 'error');
@@ -3492,6 +3592,21 @@ function wireEvents() {
   document.getElementById('force-sync-btn').addEventListener('click', forceRefreshFromCloud);
   document.getElementById('sync-debug-close').addEventListener('click', hideSyncDebug);
   document.getElementById('sync-debug-refresh').addEventListener('click', forceRefreshFromCloud);
+
+  // Header refresh button — visible whenever signed in
+  document.getElementById('refresh-btn').addEventListener('click', async () => {
+    const btn = document.getElementById('refresh-btn');
+    btn.style.opacity = '0.5';
+    btn.style.pointerEvents = 'none';
+    btn.querySelector('svg').style.animation = 'spin 800ms linear infinite';
+    try {
+      await forceRefreshFromCloud();
+    } finally {
+      btn.style.opacity = '';
+      btn.style.pointerEvents = '';
+      btn.querySelector('svg').style.animation = '';
+    }
+  });
 
   // Join by code (trips screen)
   document.getElementById('show-join-btn').addEventListener('click', showJoinPanel);
