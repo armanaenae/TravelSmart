@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#f7f7f5" media="(prefers-color-scheme: light)" />
+  <meta name="theme-color" content="#0a0b0d" media="(prefers-color-scheme: dark)" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="Itinerary" />
+  <meta name="description" content="Offline-first travel itinerary planner with maps, weather, and cloud sync" />
+  <link rel="manifest" href="manifest.json" />
+  <link rel="icon" type="image/png" href="icons/icon-192.png" />
+  <link rel="apple-touch-icon" href="icons/icon-192.png" />
+
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+
+  <!-- Leaflet CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+
+  <link rel="stylesheet" href="styles.css" />
+  <title>Itinerary Planner</title>
+
+  <!-- Theme init (before body renders to avoid FOUC) -->
+  <script>
+    (function() {
+      var saved = localStorage.getItem('theme');
+      var sys = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+      document.documentElement.setAttribute('data-theme', saved || sys);
+    })();
+  </script>
+</head>
+<body>
+  <!-- ============ APP HEADER ============ -->
+  <header class="app-header">
+    <div class="header-inner">
+      <button id="back-btn" class="icon-btn hidden" aria-label="Back">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>
+      </button>
+      <h1 id="header-title">Itinerary</h1>
+      <div class="header-actions">
+        <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme" title="Toggle theme">
+          <svg class="theme-icon-light" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+          <svg class="theme-icon-dark hidden" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+        </button>
+        <button id="auth-chip" class="auth-chip" aria-label="Sign in">
+          <span class="sync-dot offline" id="sync-dot" title="Offline / signed out"></span>
+          <span class="avatar" id="auth-avatar">?</span>
+          <span id="auth-label">Sign in</span>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main id="app">
+
+    <!-- ============ VIEW 1: TRIPS LIST ============ -->
+    <section id="view-trips" class="view active">
+      <div id="config-banner" class="config-banner hidden">
+        <strong>Local-only mode.</strong> Cross-device sync is disabled — add your Firebase keys to <code>firebase-config.js</code> to enable Google sign-in and sync. See <code>README.md</code>.
+      </div>
+
+      <div id="signin-prompt" class="signin-prompt hidden">
+        <div class="txt">
+          <strong>Sign in to sync</strong>
+          <p>Access your trips from any phone or computer.</p>
+        </div>
+        <button id="signin-prompt-btn" class="btn btn-primary btn-sm">Sign in with Google</button>
+      </div>
+
+      <div class="toolbar">
+        <button id="new-trip-btn" class="btn btn-primary">
+          <span class="btn-icon">+</span> New Trip
+        </button>
+        <label class="btn btn-ghost">
+          <span class="btn-icon">↑</span> Import
+          <input type="file" id="import-trips-file" accept=".json" hidden />
+        </label>
+      </div>
+
+      <div id="trips-grid" class="trips-grid"></div>
+
+      <div id="trips-empty" class="empty-state hidden">
+        <div class="empty-icon">✦</div>
+        <h2>No trips yet</h2>
+        <p>Create your first trip to start planning your next adventure.</p>
+        <button class="btn btn-primary" onclick="document.getElementById('new-trip-btn').click()">Create Trip</button>
+      </div>
+    </section>
+
+    <!-- ============ VIEW 3: TRIP DETAIL ============ -->
+    <section id="view-trip-detail" class="view">
+      <div class="trip-header">
+        <h2 id="trip-detail-name">Trip Name</h2>
+        <p id="trip-detail-dates" class="muted"></p>
+
+        <div class="stats-row">
+          <div class="stat-card">
+            <div class="stat-label">Total Cost</div>
+            <div class="stat-value" id="stat-cost">RM 0</div>
+            <div class="stat-sub" id="stat-cost-sub"></div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Budget</div>
+            <div class="stat-value" id="stat-budget">—</div>
+            <div class="budget-bar hidden" id="budget-bar-wrap"><div class="fill" id="budget-fill" style="width:0%"></div></div>
+            <div class="stat-sub" id="stat-budget-sub"></div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Days</div>
+            <div class="stat-value" id="stat-days">0</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Activities</div>
+            <div class="stat-value" id="stat-activities">0</div>
+          </div>
+        </div>
+
+        <div id="weather-strip" class="weather-strip hidden"></div>
+
+        <div class="toolbar">
+          <button id="add-activity-btn" class="btn btn-primary">
+            <span class="btn-icon">+</span> Add Activity
+          </button>
+          <label class="btn btn-ghost">
+            <span class="btn-icon">↑</span> Import
+            <input type="file" id="import-activities-file" accept=".csv,.json" hidden />
+          </label>
+          <button id="edit-trip-btn" class="btn btn-ghost">Edit</button>
+          <button id="export-pdf-btn" class="btn btn-ghost">📄 PDF</button>
+          <button id="export-trip-btn" class="btn btn-ghost">JSON</button>
+          <button id="delete-trip-btn" class="btn btn-danger-ghost">Delete</button>
+        </div>
+
+        <!-- Tabs -->
+        <div class="tabs" role="tablist">
+          <button class="tab active" data-tab="schedule" role="tab">Schedule</button>
+          <button class="tab" data-tab="map" role="tab">Map</button>
+        </div>
+      </div>
+
+      <!-- Schedule tab -->
+      <div id="tab-schedule" class="tab-panel">
+        <div id="schedule" class="schedule"></div>
+      </div>
+
+      <!-- Map tab -->
+      <div id="tab-map" class="tab-panel hidden">
+        <div class="map-container large">
+          <div id="trip-map"></div>
+          <div id="trip-map-empty" class="map-empty hidden">
+            <div style="font-size:32px">📍</div>
+            <div>No pinned locations yet.</div>
+            <div class="subtle">Add coordinates to your activities to see them mapped here.</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ VIEW 5: ACTIVITY FORM ============ -->
+    <section id="view-activity-form" class="view">
+      <form id="activity-form" class="form">
+        <h2 id="activity-form-title">Add Activity</h2>
+        <p class="form-sub">Fill in details, pick a location on the map, and add transport info if needed.</p>
+
+        <div class="form-group">
+          <label for="af-name">Name <span class="req">*</span></label>
+          <input type="text" id="af-name" required maxlength="120" placeholder="e.g. Petronas Twin Towers" />
+        </div>
+
+        <div class="form-group">
+          <label for="af-description">Description</label>
+          <textarea id="af-description" rows="2" placeholder="Optional notes"></textarea>
+        </div>
+
+        <div class="form-row-3">
+          <div class="form-group">
+            <label for="af-day">Day <span class="req">*</span></label>
+            <input type="number" id="af-day" required min="1" value="1" inputmode="numeric" />
+          </div>
+          <div class="form-group">
+            <label for="af-time">Time <span class="req">*</span></label>
+            <input type="time" id="af-time" required value="09:00" />
+          </div>
+          <div class="form-group">
+            <label for="af-duration">Duration (min) <span class="req">*</span></label>
+            <input type="number" id="af-duration" required min="0" value="60" inputmode="numeric" />
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="af-cost">Cost (RM)</label>
+            <input type="number" id="af-cost" min="0" step="0.01" value="0" inputmode="decimal" />
+          </div>
+          <div class="form-group">
+            <label for="af-travel">Travel to Next (min)</label>
+            <input type="number" id="af-travel" min="0" value="0" inputmode="numeric" />
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label for="af-category">Category</label>
+          <select id="af-category">
+            <option value="food">🍽️ Food</option>
+            <option value="sightseeing">🏛️ Sightseeing</option>
+            <option value="adventure">🎢 Adventure</option>
+            <option value="shopping">🛍️ Shopping</option>
+            <option value="transport">🚗 Transport</option>
+            <option value="accommodation">🏨 Accommodation</option>
+            <option value="other">📌 Other</option>
+          </select>
+        </div>
+
+        <!-- Location -->
+        <div class="form-section">
+          <h3>Location</h3>
+          <div class="form-group location-search">
+            <label for="af-location">Search or type a place</label>
+            <input type="text" id="af-location" placeholder="e.g. Petronas Twin Towers, Kuala Lumpur" autocomplete="off" />
+            <div id="location-results" class="location-results hidden"></div>
+            <div id="coord-preview" class="coord-preview hidden">
+              <span id="coord-preview-text"></span>
+              <button type="button" class="clear-coord" id="clear-coord">Clear pin</button>
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label for="af-lat">Latitude</label>
+              <input type="number" id="af-lat" step="any" placeholder="e.g. 3.1579" inputmode="decimal" />
+            </div>
+            <div class="form-group">
+              <label for="af-lng">Longitude</label>
+              <input type="number" id="af-lng" step="any" placeholder="e.g. 101.7115" inputmode="decimal" />
+            </div>
+          </div>
+        </div>
+
+        <!-- Transport fields (conditional) -->
+        <div class="form-section" id="transport-fields">
+          <h3>Transport Details</h3>
+          <div class="form-row">
+            <div class="form-group">
+              <label for="af-tp-ref">Ref / Number</label>
+              <input type="text" id="af-tp-ref" placeholder="e.g. MH123, ETS9421, Bus BC10" />
+            </div>
+            <div class="form-group">
+              <label for="af-tp-carrier">Carrier</label>
+              <input type="text" id="af-tp-carrier" placeholder="e.g. Malaysia Airlines, KTMB" />
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group location-search">
+              <label for="af-tp-from">From</label>
+              <input type="text" id="af-tp-from" placeholder="e.g. KLIA T1, KL Sentral" autocomplete="off" />
+              <div id="tp-from-results" class="location-results hidden"></div>
+            </div>
+            <div class="form-group location-search">
+              <label for="af-tp-to">To (destination)</label>
+              <input type="text" id="af-tp-to" placeholder="e.g. Penang Airport, KL Sentral" autocomplete="off" />
+              <div id="tp-to-results" class="location-results hidden"></div>
+            </div>
+          </div>
+          <p class="help" style="margin-top:-4px">Pick from search results to auto-pin From and To on the map. The pin above (location) is used as the departure; the destination is added as a second pin and connected by a dashed line.</p>
+        </div>
+
+        <!-- Accommodation fields (conditional) -->
+        <div class="form-section" id="accommodation-fields">
+          <h3>Accommodation Details</h3>
+          <div class="form-row">
+            <div class="form-group">
+              <label for="af-ac-checkin">Check-in Time</label>
+              <input type="time" id="af-ac-checkin" />
+            </div>
+            <div class="form-group">
+              <label for="af-ac-checkout">Check-out Time</label>
+              <input type="time" id="af-ac-checkout" />
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label for="af-ac-nights">Nights</label>
+              <input type="number" id="af-ac-nights" min="1" placeholder="e.g. 3" inputmode="numeric" />
+            </div>
+            <div class="form-group">
+              <label for="af-ac-confirmation">Booking / Confirmation #</label>
+              <input type="text" id="af-ac-confirmation" placeholder="e.g. AGD-8827733" />
+            </div>
+          </div>
+          <div class="form-group">
+            <label for="af-ac-address">Address</label>
+            <input type="text" id="af-ac-address" placeholder="Full hotel address" />
+          </div>
+          <div class="form-group">
+            <label for="af-ac-contact">Contact / Phone</label>
+            <input type="text" id="af-ac-contact" placeholder="e.g. +60 3-1234 5678" />
+          </div>
+        </div>
+
+        <div class="form-actions">
+          <button type="button" id="af-cancel" class="btn btn-ghost">Cancel</button>
+          <button type="submit" class="btn btn-primary">Save Activity</button>
+        </div>
+      </form>
+    </section>
+
+  </main>
+
+  <!-- ============ NEW/EDIT TRIP MODAL ============ -->
+  <div id="trip-modal" class="modal-overlay hidden" role="dialog" aria-modal="true">
+    <div class="modal">
+      <form id="trip-form" class="form">
+        <h2 id="trip-modal-title">New Trip</h2>
+        <p class="form-sub">Name your trip, set the start date, and optionally add a budget.</p>
+
+        <div class="form-group">
+          <label for="tf-name">Trip Name <span class="req">*</span></label>
+          <input type="text" id="tf-name" required maxlength="120" placeholder="e.g. Penang Weekend" />
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="tf-start">Start Date <span class="req">*</span></label>
+            <input type="date" id="tf-start" required />
+          </div>
+          <div class="form-group">
+            <label for="tf-days">Days <span class="req">*</span></label>
+            <input type="number" id="tf-days" required min="1" value="3" inputmode="numeric" />
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="tf-budget">Budget (RM)</label>
+            <input type="number" id="tf-budget" min="0" step="0.01" placeholder="Optional" inputmode="decimal" />
+          </div>
+          <div class="form-group location-search">
+            <label for="tf-location">Location (for weather)</label>
+            <input type="text" id="tf-location" placeholder="e.g. Penang" autocomplete="off" />
+            <div id="trip-location-results" class="location-results hidden"></div>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label for="tf-description">Description</label>
+          <textarea id="tf-description" rows="2" placeholder="Optional notes"></textarea>
+        </div>
+
+        <div class="form-actions">
+          <button type="button" id="tf-cancel" class="btn btn-ghost">Cancel</button>
+          <button type="submit" class="btn btn-primary">Save Trip</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ============ TOAST ============ -->
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+  <!-- ============ INSTALL BANNER ============ -->
+  <div id="install-banner" class="install-banner hidden">
+    <div class="install-text">
+      <p class="install-title">Install Itinerary</p>
+      <p class="install-sub">Add to home screen for offline access.</p>
+    </div>
+    <button id="install-btn" class="btn btn-primary btn-sm">Install</button>
+    <button id="install-dismiss" class="btn btn-ghost btn-sm" aria-label="Dismiss">✕</button>
+  </div>
+
+  <!-- Leaflet JS -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+
+  <!-- html2pdf (jsPDF + html2canvas bundled) for PDF export -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+
+  <!-- Firebase SDK (compat build — works with plain scripts) -->
+  <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-firestore-compat.js"></script>
+
+  <!-- App scripts -->
+  <script src="firebase-config.js"></script>
+  <script src="weather.js"></script>
+  <script src="map.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
