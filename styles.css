@@ -1403,7 +1403,35 @@ html[data-theme="dark"] .form-group select {
 .invite-form {
   display: flex;
   gap: 8px;
+  flex-wrap: wrap;
 }
+.invite-form .btn { flex-shrink: 0; }
+@media (max-width: 480px) {
+  .invite-form input { flex: 1 1 100%; }
+  .invite-form .btn { flex: 1 1 100%; }
+}
+.share-link-block {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
+}
+.share-link-row {
+  display: flex;
+  gap: 8px;
+}
+.share-link-row input {
+  flex: 1;
+  padding: 10px 12px;
+  font-size: 13px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: var(--font-mono);
+  min-width: 0;
+}
+.share-link-row input:focus { outline: none; border-color: var(--accent); }
 .invite-form input {
   flex: 1;
   padding: 11px 14px;

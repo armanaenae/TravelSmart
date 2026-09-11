@@ -116,10 +116,18 @@ function reqP(request) {
 /* --- Trips --- */
 async function getAllTrips() { return reqP(tx(STORE_TRIPS).getAll()); }
 async function getTrip(id) { return reqP(tx(STORE_TRIPS).get(id)); }
-async function saveTrip(trip) {
+async function saveTrip(trip, opts = {}) {
   trip.updatedAt = Date.now();
   await reqP(tx(STORE_TRIPS, 'readwrite').put(trip));
-  if (state.user && !trip._fromCloud) syncTripUp(trip);
+  if (state.user && !trip._fromCloud) {
+    // opts.awaitCloud: wait for the Firestore write to be acknowledged
+    // (important for invite flows before sign-out).
+    if (opts.awaitCloud) {
+      await syncTripUp(trip);
+    } else {
+      syncTripUp(trip);
+    }
+  }
   return trip;
 }
 async function deleteTripDB(id) {
@@ -307,6 +315,11 @@ async function handleAuthChange(user) {
     // Push local trips that don't have ownerUid (first-run only)
     await migrateLocalToCloud();
     renderTripsList();
+    // Handle pending invite from URL, if any
+    if (state._pendingInvite) {
+      // Give listeners a beat, then check
+      setTimeout(() => tryAcceptPendingInvite(), 500);
+    }
   } else {
     // Signed out — clear local + cloud subs + gate
     stopCloudSync();
@@ -594,7 +607,12 @@ async function syncTripUp(trip) {
     if (!clean.ownerUid) clean.ownerUid = state.user.uid;
     if (!Array.isArray(clean.collaborators)) clean.collaborators = [];
     await tripDoc(trip.id).set(clean, { merge: true });
-  } catch (err) { console.warn('Trip upload failed:', err); }
+    // With offline persistence enabled, set() resolves once the write is queued
+    // locally, NOT once the server has acked. If we sign out immediately after
+    // (e.g. after inviting), that queued write is dropped. Force a server
+    // round-trip so critical writes (like invite) actually land.
+    try { await state.firestore.waitForPendingWrites(); } catch (e) {}
+  } catch (err) { console.warn('Trip upload failed:', err); throw err; }
 }
 async function deleteTripCloud(id) {
   if (!state.user) return;
@@ -1451,13 +1469,15 @@ async function renderPeopleTab() {
 
   // Show / hide invite form based on ownership
   const inviteForm = document.getElementById('invite-form');
-  const inviteWrap = inviteForm && inviteForm.parentElement;
   if (inviteForm) {
     inviteForm.style.display = isOwner ? '' : 'none';
     if (!isOwner && inviteForm.nextElementSibling) {
       inviteForm.nextElementSibling.style.display = 'none';
     }
   }
+
+  // Share link UI
+  await renderShareLinkUI();
 }
 
 async function handleInviteCollaborator(e) {
@@ -1482,9 +1502,22 @@ async function handleInviteCollaborator(e) {
   const list = Array.isArray(trip.collaborators) ? [...trip.collaborators] : [];
   if (list.includes(email)) { toast('Already invited', 'error'); return; }
   list.push(email);
-  await saveTrip({ ...trip, collaborators: list, ownerEmail: state.user.email || null });
-  emailInput.value = '';
-  toast(`Invited ${email}`, 'success');
+
+  const inviteBtn = document.querySelector('#invite-form button[type="submit"]');
+  if (inviteBtn) { inviteBtn.disabled = true; inviteBtn.textContent = 'Inviting…'; }
+  try {
+    await saveTrip(
+      { ...trip, collaborators: list, ownerEmail: (state.user.email || '').toLowerCase() || null },
+      { awaitCloud: true }
+    );
+    emailInput.value = '';
+    toast(`Invited ${email}`, 'success');
+  } catch (err) {
+    console.error(err);
+    toast('Invite failed: ' + (err.message || 'unknown'), 'error');
+  } finally {
+    if (inviteBtn) { inviteBtn.disabled = false; inviteBtn.textContent = 'Invite'; }
+  }
   await renderPeopleTab();
 }
 
@@ -1493,9 +1526,221 @@ async function handleRemoveCollaborator(email) {
   const trip = await getTrip(state.currentTripId);
   if (!trip) return;
   const list = (trip.collaborators || []).filter(e => e.toLowerCase() !== email.toLowerCase());
-  await saveTrip({ ...trip, collaborators: list });
-  toast('Collaborator removed', 'success');
+  try {
+    await saveTrip({ ...trip, collaborators: list }, { awaitCloud: true });
+    toast('Collaborator removed', 'success');
+  } catch (err) {
+    toast('Remove failed: ' + (err.message || 'unknown'), 'error');
+  }
   await renderPeopleTab();
+}
+
+/* =============================================================
+ * SHARE LINK / INVITE FLOW
+ * ============================================================= */
+function randomShareToken() {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function buildInviteUrl(tripId, token) {
+  const url = new URL(window.location.href);
+  url.search = '';
+  url.hash = '';
+  url.searchParams.set('join', String(tripId));
+  url.searchParams.set('t', token);
+  return url.toString();
+}
+
+async function renderShareLinkUI() {
+  const trip = await getTrip(state.currentTripId);
+  if (!trip) return;
+  const emptyEl = document.getElementById('share-link-empty');
+  const activeEl = document.getElementById('share-link-active');
+  const inputEl = document.getElementById('share-link-input');
+  const genBtn = document.getElementById('share-link-generate');
+  const revBtn = document.getElementById('share-link-revoke');
+  const isOwner = trip.ownerUid === state.user?.uid;
+
+  const wrap = document.getElementById('share-link-block');
+  wrap.style.display = isOwner ? '' : 'none';
+  if (!isOwner) return;
+
+  if (trip.shareToken) {
+    emptyEl.classList.add('hidden');
+    activeEl.classList.remove('hidden');
+    inputEl.value = buildInviteUrl(trip.id, trip.shareToken);
+    genBtn.textContent = 'Regenerate link';
+    revBtn.classList.remove('hidden');
+  } else {
+    emptyEl.classList.remove('hidden');
+    activeEl.classList.add('hidden');
+    genBtn.textContent = 'Generate link';
+    revBtn.classList.add('hidden');
+  }
+}
+
+async function handleGenerateShareLink() {
+  const trip = await getTrip(state.currentTripId);
+  if (!trip) return;
+  if (trip.ownerUid !== state.user?.uid) {
+    toast('Only the owner can create a link', 'error');
+    return;
+  }
+  const token = randomShareToken();
+  try {
+    await saveTrip({ ...trip, shareToken: token }, { awaitCloud: true });
+    toast('Link ready to share', 'success');
+    await renderShareLinkUI();
+  } catch (err) {
+    toast('Failed: ' + (err.message || 'unknown'), 'error');
+  }
+}
+
+async function handleRevokeShareLink() {
+  const trip = await getTrip(state.currentTripId);
+  if (!trip) return;
+  if (!confirm('Revoke the current invite link? Anyone with the old link will no longer be able to join.')) return;
+  try {
+    await saveTrip({ ...trip, shareToken: null }, { awaitCloud: true });
+    toast('Link revoked', 'success');
+    await renderShareLinkUI();
+  } catch (err) {
+    toast('Failed: ' + (err.message || 'unknown'), 'error');
+  }
+}
+
+async function handleCopyShareLink() {
+  const input = document.getElementById('share-link-input');
+  if (!input || !input.value) return;
+  try {
+    if (navigator.share) {
+      await navigator.share({ url: input.value, title: 'Join my trip' });
+    } else {
+      await navigator.clipboard.writeText(input.value);
+      toast('Link copied', 'success');
+    }
+  } catch (err) {
+    // fallback: select the text
+    input.select();
+    input.setSelectionRange(0, 99999);
+    try {
+      document.execCommand('copy');
+      toast('Link copied', 'success');
+    } catch (e) {
+      toast('Copy failed — long-press to copy', 'error');
+    }
+  }
+}
+
+/**
+ * Called at boot: if ?join=<id>&t=<token> is in the URL, remember it.
+ * After sign-in, we attempt to accept.
+ */
+function readPendingInviteFromURL() {
+  const p = new URLSearchParams(window.location.search);
+  const tripId = p.get('join');
+  const token = p.get('t');
+  if (!tripId || !token) return null;
+  return { tripId: Number(tripId), token };
+}
+
+async function tryAcceptPendingInvite() {
+  const pending = state._pendingInvite;
+  if (!pending || !state.user || !state.firebaseReady) return;
+
+  try {
+    // Try to read the trip directly (rules must allow shareToken-based read too)
+    const docSnap = await tripDoc(pending.tripId).get();
+    if (!docSnap.exists) {
+      toast('Invite is invalid or was revoked', 'error');
+      clearPendingInvite();
+      return;
+    }
+    const data = docSnap.data();
+    if (!data.shareToken || data.shareToken !== pending.token) {
+      toast('Invite is no longer valid', 'error');
+      clearPendingInvite();
+      return;
+    }
+    const myEmail = (state.user.email || '').toLowerCase();
+    if (!myEmail) { toast('No email on account', 'error'); return; }
+
+    // If already a collaborator or owner — just deep-link
+    if (data.ownerUid === state.user.uid || (data.collaborators || []).map(e => e.toLowerCase()).includes(myEmail)) {
+      clearPendingInvite();
+      state.currentTripId = pending.tripId;
+      switchView('trip-detail');
+      switchTab('schedule');
+      // Wait a bit for sync to populate details
+      setTimeout(() => renderTripDetail(), 300);
+      return;
+    }
+
+    // Show confirm modal
+    document.getElementById('accept-invite-body').textContent =
+      `You've been invited to collaborate on "${data.name || 'a trip'}".`;
+    const dt = document.getElementById('accept-invite-detail');
+    dt.innerHTML = `
+      <div class="stay-card" style="padding:14px">
+        <div class="stay-name" style="font-size:16px">${escapeHtml(data.name || 'Trip')}</div>
+        <div class="stay-address" style="margin-top:4px">${escapeHtml(fmtDateRange(data.startDate, data.days))}</div>
+        <div class="subtle" style="font-size:12px;margin-top:6px">You'll join as an editor with full access.</div>
+      </div>
+    `;
+    document.getElementById('accept-invite-modal').classList.remove('hidden');
+    // Buttons wire once
+    document.getElementById('accept-invite-accept').onclick = async () => {
+      await acceptInvite(pending, data);
+    };
+    document.getElementById('accept-invite-decline').onclick = () => {
+      document.getElementById('accept-invite-modal').classList.add('hidden');
+      clearPendingInvite();
+    };
+  } catch (err) {
+    console.warn('Invite check failed:', err);
+    toast('Could not check invite: ' + (err.code || err.message), 'error');
+  }
+}
+
+async function acceptInvite(pending, tripData) {
+  const myEmail = (state.user.email || '').toLowerCase();
+  try {
+    // Build the new collaborators list
+    const existing = Array.isArray(tripData.collaborators) ? [...tripData.collaborators] : [];
+    if (!existing.map(e => e.toLowerCase()).includes(myEmail)) existing.push(myEmail);
+
+    // Write ONLY these fields — rules require nothing else to change
+    await tripDoc(pending.tripId).update({
+      collaborators: existing,
+      shareToken: tripData.shareToken,  // unchanged, but keeps write safe
+      updatedAt: Date.now(),
+    });
+
+    document.getElementById('accept-invite-modal').classList.add('hidden');
+    clearPendingInvite();
+    toast('Joined trip!', 'success');
+    // Deep-link into the trip after a moment (listener will populate it)
+    setTimeout(() => {
+      state.currentTripId = pending.tripId;
+      switchView('trip-detail');
+      switchTab('schedule');
+      renderTripDetail();
+    }, 400);
+  } catch (err) {
+    console.error(err);
+    toast('Could not join: ' + (err.code || err.message), 'error');
+  }
+}
+
+function clearPendingInvite() {
+  state._pendingInvite = null;
+  // Clean URL
+  const url = new URL(window.location.href);
+  url.searchParams.delete('join');
+  url.searchParams.delete('t');
+  window.history.replaceState({}, document.title, url.pathname + (url.search || ''));
 }
 
 async function renderWeather() {
@@ -2829,7 +3074,6 @@ function wireEvents() {
   // Trip detail
   document.getElementById('add-activity-btn').addEventListener('click', () => openActivityForm(null));
   document.getElementById('edit-trip-btn').addEventListener('click', () => openTripModal(state.currentTripId));
-  document.getElementById('export-trip-btn').addEventListener('click', handleExportTrip);
   document.getElementById('export-pdf-btn').addEventListener('click', handleExportPDF);
   document.getElementById('delete-trip-btn').addEventListener('click', handleDeleteTrip);
   document.getElementById('import-activities-file').addEventListener('change', (e) => {
@@ -2990,6 +3234,14 @@ function wireEvents() {
   // ===== People / invites =====
   document.getElementById('invite-form').addEventListener('submit', handleInviteCollaborator);
   document.getElementById('people-signin-btn').addEventListener('click', signIn);
+  document.getElementById('share-link-generate').addEventListener('click', handleGenerateShareLink);
+  document.getElementById('share-link-revoke').addEventListener('click', handleRevokeShareLink);
+  document.getElementById('share-link-copy').addEventListener('click', handleCopyShareLink);
+  document.getElementById('accept-invite-modal').addEventListener('click', (e) => {
+    if (e.target.id === 'accept-invite-modal') {
+      document.getElementById('accept-invite-modal').classList.add('hidden');
+    }
+  });
 
   // ===== Activity form attachments =====
   document.getElementById('af-attach-file').addEventListener('change', (e) => {
@@ -3015,6 +3267,14 @@ async function init() {
     return;
   }
   wireEvents();
+
+  // Detect invite link
+  state._pendingInvite = readPendingInviteFromURL();
+  if (state._pendingInvite) {
+    // Hint to user on login
+    const banner = document.querySelector('#view-login .login-sub');
+    if (banner) banner.textContent = "Sign in to accept your trip invitation.";
+  }
 
   // Show login gate by default
   switchView('login');

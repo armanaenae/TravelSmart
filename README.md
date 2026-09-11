@@ -7,7 +7,7 @@ An offline-first Progressive Web App for planning travel itineraries. Sync your 
 - ✈️ Trips + activities with day/time scheduling, cost, travel time
 - 🏨 **Stays tab** — hotels & lodging entered once, auto-populated on every night of the schedule
 - 💡 **Ideas tab** — parking lot for places you might visit; promote to a specific day when ready
-- 👥 **Collaboration** — invite by Google email, everyone shares full edit access on that trip
+- 👥 **Collaboration** — invite by Google email OR shareable invite link, everyone shares full edit access on that trip
 - 📎 **File attachments** — upload booking PDFs, receipts, tickets to any activity or stay (5 MB each, stored locally on device)
 - 🗺️ Leaflet map — pin locations, view daily routes, full-trip map
 - 🔍 Location search + auto-geocode (free, no API key)
@@ -72,28 +72,56 @@ The app **works immediately in local-only mode** — no Firebase needed. Do step
    service cloud.firestore {
      match /databases/{database}/documents {
 
-       // A trip is readable/writable by its owner or any listed collaborator (email).
+       function isSignedIn() { return request.auth != null; }
+       function myEmail() { return request.auth.token.email.lower(); }
+
        function isOwner(data) {
-         return request.auth != null && data.ownerUid == request.auth.uid;
+         return isSignedIn() && data.ownerUid == request.auth.uid;
        }
        function isCollaborator(data) {
-         return request.auth != null
+         return isSignedIn()
              && data.collaborators is list
              && request.auth.token.email != null
-             && data.collaborators.hasAny([request.auth.token.email.lower()]);
+             && data.collaborators.hasAny([myEmail()]);
        }
        function hasAccess(data) {
          return isOwner(data) || isCollaborator(data);
        }
 
+       // For invite links: a signed-in user is joining themselves via a shareToken.
+       // Their write is allowed only if:
+       //   - the trip's shareToken is set AND unchanged in this write
+       //   - the ONLY field they're changing is `collaborators` (+ updatedAt)
+       //   - they're adding exactly THEIR email to the list
+       function isSelfJoinViaToken() {
+         return isSignedIn()
+           && request.auth.token.email != null
+           && resource.data.shareToken != null
+           && resource.data.shareToken is string
+           && request.resource.data.shareToken == resource.data.shareToken
+           && request.resource.data.ownerUid == resource.data.ownerUid
+           && request.resource.data.name == resource.data.name
+           && request.resource.data.collaborators is list
+           && request.resource.data.collaborators.hasAll(resource.data.collaborators)
+           && myEmail() in request.resource.data.collaborators
+           && (resource.data.collaborators == null
+               || !(myEmail() in resource.data.collaborators));
+       }
+
        match /trips/{tripId} {
-         // Read: owner or collaborator
-         allow read: if resource == null || hasAccess(resource.data);
+         // GET (single-doc read): any signed-in user — needed for invite links to
+         // read the trip's shareToken before joining. The doc still contains only
+         // your own trip data; the shareToken guards write access.
+         allow get: if isSignedIn();
+         // LIST (queries): only the queries the app makes — filtered by ownerUid
+         // OR by array-contains on your own email.
+         allow list: if hasAccess(resource.data);
+
          // Create: must set ownerUid to self
-         allow create: if request.auth != null
+         allow create: if isSignedIn()
                        && request.resource.data.ownerUid == request.auth.uid;
-         // Update: owner OR collaborator (both have full edit)
-         allow update: if hasAccess(resource.data);
+         // Update: owner OR collaborator (full edit) OR self-join via shareToken
+         allow update: if hasAccess(resource.data) || isSelfJoinViaToken();
          // Delete: owner only
          allow delete: if isOwner(resource.data);
 
@@ -103,9 +131,9 @@ The app **works immediately in local-only mode** — no Firebase needed. Do step
          }
        }
 
-       // Legacy path from earlier versions — kept read/write for one-time migration
+       // Legacy path — kept read/write for one-time migration on first sign-in
        match /users/{uid}/{document=**} {
-         allow read, write: if request.auth != null && request.auth.uid == uid;
+         allow read, write: if isSignedIn() && request.auth.uid == uid;
        }
      }
    }
