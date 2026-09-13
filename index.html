@@ -203,7 +203,8 @@
 
         <!-- Tabs -->
         <div class="tabs" role="tablist">
-          <button class="tab active" data-tab="schedule" role="tab">Schedule</button>
+          <button class="tab active" data-tab="today" role="tab">Today</button>
+          <button class="tab" data-tab="schedule" role="tab">Schedule</button>
           <button class="tab" data-tab="stays" role="tab">Stays</button>
           <button class="tab" data-tab="ideas" role="tab">Ideas</button>
           <button class="tab" data-tab="map" role="tab">Map</button>
@@ -211,8 +212,13 @@
         </div>
       </div>
 
+      <!-- Today tab -->
+      <div id="tab-today" class="tab-panel">
+        <div id="today-content"></div>
+      </div>
+
       <!-- Schedule tab -->
-      <div id="tab-schedule" class="tab-panel">
+      <div id="tab-schedule" class="tab-panel hidden">
         <div id="schedule" class="schedule"></div>
       </div>
 
@@ -662,6 +668,62 @@
   <!-- ============ TOAST ============ -->
   <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
 
+  <!-- ============ QUICK-ADD EXPENSE FAB ============ -->
+  <button id="fab-expense" class="fab hidden" aria-label="Quick add expense" title="Quick add expense">
+    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+  </button>
+
+  <!-- ============ QUICK EXPENSE MODAL ============ -->
+  <div id="quick-expense-modal" class="modal-overlay hidden" role="dialog" aria-modal="true">
+    <div class="modal">
+      <form id="quick-expense-form" class="form">
+        <h2>Quick expense</h2>
+        <p class="form-sub">Log a spend in seconds. It'll appear on today's schedule.</p>
+
+        <div class="form-group">
+          <label for="qe-amount">Amount (RM) <span class="req">*</span></label>
+          <input type="number" id="qe-amount" required min="0" step="0.01" inputmode="decimal" placeholder="45.00" autocomplete="off" />
+        </div>
+
+        <div class="form-group">
+          <label for="qe-label">What was it? <span class="req">*</span></label>
+          <input type="text" id="qe-label" required maxlength="120" placeholder="e.g. Lunch at Nasi Kandar" autocomplete="off" />
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="qe-category">Category</label>
+            <select id="qe-category">
+              <option value="food">🍽️ Food</option>
+              <option value="transport">🚗 Transport</option>
+              <option value="sightseeing">🏛️ Sightseeing</option>
+              <option value="shopping">🛍️ Shopping</option>
+              <option value="adventure">🎢 Adventure</option>
+              <option value="other">📌 Other</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="qe-day">Day</label>
+            <input type="number" id="qe-day" min="1" inputmode="numeric" />
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label class="quick-toggle">
+            <input type="checkbox" id="qe-add-receipt" />
+            <span>📷 Attach receipt photo (optional)</span>
+          </label>
+          <input type="file" id="qe-receipt-file" accept="image/*" capture="environment" hidden />
+        </div>
+
+        <div class="form-actions">
+          <button type="button" id="qe-cancel" class="btn btn-ghost">Cancel</button>
+          <button type="submit" class="btn btn-primary">Log expense</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
   <!-- ============ SYNC DEBUG PANEL (long-press auth chip to toggle) ============ -->
   <div id="sync-debug" class="sync-debug hidden">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
@@ -692,6 +754,7 @@
   <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-auth-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-firestore-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-storage-compat.js"></script>
 
   <!-- App scripts -->
   <script src="firebase-config.js"></script>

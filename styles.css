@@ -1664,6 +1664,178 @@ html[data-theme="dark"] .form-group select {
 .login-features .lf-item strong { font-weight: 600; color: var(--text); font-size: 13.5px; display: block; margin-bottom: 2px; }
 .login-features .lf-item .subtle { font-size: 12.5px; line-height: 1.4; }
 
+/* =========================================
+   FAB — Quick add expense
+   ========================================= */
+.fab {
+  position: fixed;
+  right: max(20px, calc(var(--safe-right) + 12px));
+  bottom: max(24px, calc(var(--safe-bottom) + 16px));
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 8px 24px -6px color-mix(in oklab, var(--accent) 60%, transparent),
+              0 2px 8px rgba(0,0,0,0.15);
+  cursor: pointer;
+  z-index: 45;
+  transition: transform 140ms ease, box-shadow 140ms ease, background 140ms ease;
+}
+.fab:hover {
+  background: var(--accent-hover);
+  transform: translateY(-2px);
+  box-shadow: 0 12px 28px -6px color-mix(in oklab, var(--accent) 65%, transparent),
+              0 4px 10px rgba(0,0,0,0.18);
+}
+.fab:active { transform: translateY(0); }
+
+.quick-toggle {
+  display: flex !important;
+  align-items: center;
+  gap: 8px;
+  text-transform: none !important;
+  letter-spacing: 0 !important;
+  font-weight: 500 !important;
+  cursor: pointer;
+  padding: 8px 0;
+}
+.quick-toggle input[type=checkbox] {
+  width: auto !important;
+  padding: 0 !important;
+  margin: 0 !important;
+}
+
+/* =========================================
+   TODAY view
+   ========================================= */
+.today-hero {
+  background: linear-gradient(135deg, var(--accent) 0%, color-mix(in oklab, var(--accent) 70%, black) 100%);
+  color: #fff;
+  padding: 24px 22px;
+  border-radius: var(--radius-lg);
+  margin-bottom: 18px;
+  position: relative;
+  overflow: hidden;
+}
+.today-hero::before {
+  content: '';
+  position: absolute;
+  top: -50%; right: -20%;
+  width: 300px; height: 300px;
+  border-radius: 50%;
+  background: rgba(255,255,255,0.08);
+  pointer-events: none;
+}
+.today-hero .th-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  opacity: 0.7;
+  margin-bottom: 4px;
+  font-weight: 600;
+}
+.today-hero .th-day {
+  font-size: 28px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin: 0 0 4px;
+  color: #fff;
+}
+.today-hero .th-date {
+  font-size: 14px;
+  opacity: 0.85;
+  font-variant-numeric: tabular-nums;
+}
+.today-hero .th-stats {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  margin-top: 20px;
+}
+.today-hero .th-stat {
+  background: rgba(255,255,255,0.14);
+  border: 1px solid rgba(255,255,255,0.16);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  backdrop-filter: blur(6px);
+}
+.today-hero .ts-label {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  opacity: 0.75;
+  margin-bottom: 3px;
+  font-weight: 600;
+}
+.today-hero .ts-value {
+  font-size: 18px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+.today-hero .th-weather {
+  margin-top: 16px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  background: rgba(255,255,255,0.12);
+  border-radius: var(--radius-sm);
+  font-size: 13.5px;
+}
+.today-hero .th-weather .tw-icon { font-size: 22px; }
+@media (max-width: 480px) {
+  .today-hero { padding: 20px 18px; }
+  .today-hero .th-day { font-size: 24px; }
+  .today-hero .ts-value { font-size: 15px; }
+}
+
+.today-section-title {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+  font-weight: 600;
+  margin: 20px 0 10px;
+}
+
+.today-upnext {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  box-shadow: var(--shadow-sm);
+}
+.today-upnext .un-time {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-size: 15px;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  min-width: 54px;
+}
+.today-upnext .un-body { flex: 1; min-width: 0; }
+.today-upnext .un-title { font-weight: 600; font-size: 15px; color: var(--text); margin-bottom: 2px; }
+.today-upnext .un-sub { font-size: 12.5px; color: var(--text-muted); }
+
+.today-empty {
+  padding: 24px;
+  text-align: center;
+  color: var(--text-muted);
+  background: var(--surface);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  font-size: 13.5px;
+}
+
 /* Sync debug panel */
 .sync-debug {
   position: fixed;

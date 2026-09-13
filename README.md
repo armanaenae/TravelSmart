@@ -8,7 +8,9 @@ An offline-first Progressive Web App for planning travel itineraries. Sync your 
 - 🏨 **Stays tab** — hotels & lodging entered once, auto-populated on every night of the schedule
 - 💡 **Ideas tab** — parking lot for places you might visit; promote to a specific day when ready
 - 👥 **Collaboration** — invite by Google email OR share a short **Trip Code** anyone signed in can enter. Full edit access for all collaborators.
-- 📎 **File attachments** — upload booking PDFs, receipts, tickets to any activity or stay (5 MB each, stored locally on device)
+- 📎 **File attachments** — upload booking PDFs, receipts, tickets to any activity or stay (5 MB each, syncs via Firebase Storage)
+- 💵 **Quick-expense FAB** — one-tap logging: amount + label + optional receipt photo; instantly appears on today's schedule
+- 📅 **Today tab** — daily briefing: what's now, what's up next, spent-so-far, budget-remaining, weather for the day
 - 🗺️ Leaflet map — pin locations, view daily routes, full-trip map
 - 🔍 Location search + auto-geocode (free, no API key)
 - 🚗 Transport details — flight/train/bus number, carrier, from/to, destination pin
@@ -201,16 +203,49 @@ Optional transport columns: `transportRef`, `transportCarrier`, `transportFrom`,
 
 ---
 
-## Attachments — local-only
+## Attachments — cloud sync (via Firebase Storage)
 
-File attachments (booking PDFs, receipts, tickets) are stored **on the device** in IndexedDB. They do NOT sync via Firebase — that would require Firebase Storage (blaze plan / billing account for larger files). Practical consequences:
+Attachments (booking PDFs, receipts, tickets) now sync across devices via **Firebase Storage**. You'll need to enable it once — free tier gives 5 GB stored + 1 GB/day downloads, plenty for personal trips.
 
-- Attachments you add on your phone stay on your phone; add them again on desktop if you want them there too
-- They survive app reinstalls if you keep the browser data
-- Deleting an activity / stay removes its attachments
-- Each file is limited to 5 MB
+### One-time setup
 
-If you want cross-device attachments too, set up Firebase Storage and I'll add the sync logic in a follow-up.
+1. Firebase Console → your project → **Build** → **Storage** → **Get started**
+2. Pick **Start in production mode** → choose the same region as your Firestore
+3. Click **Done** — this creates a storage bucket
+4. Go to Storage → **Rules** tab and paste this, then **Publish**:
+
+   ```
+   rules_version = '2';
+   service firebase.storage {
+     match /b/{bucket}/o {
+       // Attachments: /attachments/{tripId}/{attachmentId}
+       // Any signed-in user with access to the parent trip in Firestore can read/write.
+       match /attachments/{tripId}/{attachmentId} {
+         allow read, write: if request.auth != null
+           && (
+             firestore.get(/databases/(default)/documents/trips/$(tripId)).data.ownerUid == request.auth.uid
+             || (
+               request.auth.token.email != null
+               && firestore.get(/databases/(default)/documents/trips/$(tripId)).data.collaborators is list
+               && request.auth.token.email.lower() in firestore.get(/databases/(default)/documents/trips/$(tripId)).data.collaborators
+             )
+           );
+       }
+     }
+   }
+   ```
+
+5. Firestore rules already handle `trips/{tripId}/attachments/{attId}` sub-collection for metadata.
+
+### How it works
+
+- Adding an attachment saves it locally AND uploads to Storage.
+- Metadata (name, size, download URL) syncs via Firestore → visible on all devices instantly.
+- Tapping an attachment on a device that doesn't have the file yet downloads it on demand.
+- Removed attachments are deleted from cloud too.
+- Old attachments uploaded before this feature auto-upload on next sign-in.
+
+If you don't enable Storage, the app falls back gracefully to device-local — attachments still work but won't cross devices.
 
 ## Notes on cost & scale
 

@@ -46,6 +46,7 @@ const state = {
   firebaseReady: false,
   firestore: null,
   auth: null,
+  storage: null,
   unsubTrips: null,
   unsubActs: null,
   syncingInitial: false,       // true while first sync payload is loading
@@ -61,6 +62,7 @@ const state = {
   editingIdeaId: null,
   schedulingIdeaId: null,
   pendingAttachments: [], // buffered until save
+  pendingQuickReceipt: null,
   unsubStays: null,
   unsubIdeas: null,
 };
@@ -275,6 +277,8 @@ async function initFirebase() {
     if (!firebase.apps.length) firebase.initializeApp(window.FIREBASE_CONFIG);
     state.auth = firebase.auth();
     state.firestore = firebase.firestore();
+    try { state.storage = firebase.storage(); }
+    catch (e) { console.warn('Firebase Storage not enabled:', e); }
     // Enable IndexedDB persistence for offline writes
     try {
       await state.firestore.enablePersistence({ synchronizeTabs: true });
@@ -322,6 +326,10 @@ async function handleAuthChange(user) {
       try {
         await forceRefreshFromCloudQuiet();
       } catch (e) { /* handled inside */ }
+      // Upload any local-only attachments now that we know they can go to cloud
+      try {
+        await backfillAttachmentsToCloud();
+      } catch (e) { console.warn('Backfill failed:', e); }
     }, 800);
   } else {
     // Signed out — clear local + cloud subs + gate
@@ -517,6 +525,7 @@ function stopCloudSync() {
   unsubAll(state.unsubActs); state.unsubActs = null;
   unsubAll(state.unsubStays); state.unsubStays = null;
   unsubAll(state.unsubIdeas); state.unsubIdeas = null;
+  unsubAll(state.unsubAtts); state.unsubAtts = null;
 }
 
 async function subscribeToAllTripChildren() {
@@ -524,13 +533,14 @@ async function subscribeToAllTripChildren() {
   if (!state.unsubActs) state.unsubActs = {};
   if (!state.unsubStays) state.unsubStays = {};
   if (!state.unsubIdeas) state.unsubIdeas = {};
+  if (!state.unsubAtts) state.unsubAtts = {};
 
   const trips = await getAllTrips();
   const wanted = new Set(trips.map(t => String(t.id)));
   console.log('[sync] subscribeToAllTripChildren, trips:', trips.map(t => ({ id: t.id, name: t.name, ownerUid: t.ownerUid, isMine: t.ownerUid === state.user.uid })));
 
   // Unsubscribe stale
-  ['unsubActs', 'unsubStays', 'unsubIdeas'].forEach(k => {
+  ['unsubActs', 'unsubStays', 'unsubIdeas', 'unsubAtts'].forEach(k => {
     Object.keys(state[k]).forEach(id => {
       if (!wanted.has(id)) { state[k][id](); delete state[k][id]; }
     });
@@ -601,6 +611,32 @@ async function subscribeToAllTripChildren() {
         }
         if (state.currentTripId === t.id && state.currentTab === 'ideas') renderIdeasTab();
       }, err => console.warn('Idea sync err:', err));
+    }
+    // Attachments (metadata only — blob is fetched on demand)
+    if (!state.unsubAtts[key]) {
+      state.unsubAtts[key] = attachmentsCol(t.id).onSnapshot(async snap => {
+        for (const ch of snap.docChanges()) {
+          const meta = ch.doc.data();
+          meta.id = Number(ch.doc.id);
+          meta.tripId = t.id;
+          if (ch.type === 'removed') {
+            await reqP(tx(STORE_ATTACHMENTS, 'readwrite').delete(meta.id));
+          } else {
+            const local = await getAttachment(meta.id);
+            if (local && local.blob) {
+              // Merge metadata, keep local blob
+              const merged = { ...local, ...meta, blob: local.blob };
+              await reqP(tx(STORE_ATTACHMENTS, 'readwrite').put(merged));
+            } else {
+              // Metadata new to us — download the blob in background
+              const blob = await downloadAttachmentFromCloud(meta);
+              await reqP(tx(STORE_ATTACHMENTS, 'readwrite').put({ ...meta, blob }));
+              if (state.currentTripId === t.id) renderTripDetail();
+            }
+          }
+        }
+        if (state.currentTripId === t.id) renderTripDetail();
+      }, err => console.warn('Attachment sync err:', err));
     }
   }
 }
@@ -847,6 +883,10 @@ function switchView(view) {
   const authChip = document.getElementById('auth-chip');
 
   const refreshBtn = document.getElementById('refresh-btn');
+  const fab = document.getElementById('fab-expense');
+
+  // Show FAB only inside a trip
+  if (fab) fab.classList.toggle('hidden', view !== 'trip-detail');
 
   // Login: hide most chrome
   if (view === 'login') {
@@ -884,10 +924,11 @@ function switchView(view) {
 function switchTab(tab) {
   state.currentTab = tab;
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
-  ['schedule', 'stays', 'ideas', 'map', 'people'].forEach(t => {
+  ['today', 'schedule', 'stays', 'ideas', 'map', 'people'].forEach(t => {
     const el = document.getElementById('tab-' + t);
     if (el) el.classList.toggle('hidden', t !== tab);
   });
+  if (tab === 'today') renderTodayTab();
   if (tab === 'map') renderTripMap();
   if (tab === 'stays') renderStaysTab();
   if (tab === 'ideas') renderIdeasTab();
@@ -949,10 +990,10 @@ async function renderTripsList() {
  * ============================================================= */
 async function openTrip(tripId) {
   state.currentTripId = tripId;
-  state.currentTab = 'schedule';
+  state.currentTab = 'today';
   await renderTripDetail();
   switchView('trip-detail');
-  switchTab('schedule');
+  switchTab('today');
   renderWeather();
 }
 
@@ -1002,6 +1043,7 @@ async function renderTripDetail() {
     ? `${fmtMoney(totalCost / trip.days)}/day avg` : '';
 
   await renderSchedule(trip, acts);
+  if (state.currentTab === 'today') renderTodayTab();
   if (state.currentTab === 'map') renderTripMap();
   if (state.currentTab === 'stays') renderStaysTab();
   if (state.currentTab === 'ideas') renderIdeasTab();
@@ -1297,6 +1339,289 @@ function dayHasCoords(acts, day) {
     if (a.category === 'transport' && Number.isFinite(a.transportToLat) && Number.isFinite(a.transportToLng)) return true;
     return false;
   });
+}
+
+/* =============================================================
+ * TODAY TAB — briefing for today's day of the trip
+ * ============================================================= */
+function currentDayOfTrip(trip) {
+  if (!trip.startDate) return null;
+  const start = parseYMD(trip.startDate);
+  start.setHours(0, 0, 0, 0);
+  const now = new Date();
+  now.setHours(0, 0, 0, 0);
+  const diff = Math.round((now - start) / 86400000);
+  const day = diff + 1;
+  if (day < 1) return { day: null, status: 'before', daysUntil: -diff };
+  if (day > trip.days) return { day: null, status: 'after', daysAgo: day - trip.days };
+  return { day, status: 'current' };
+}
+
+async function renderTodayTab() {
+  const container = document.getElementById('today-content');
+  const trip = await getTrip(state.currentTripId);
+  if (!trip) return;
+
+  const info = currentDayOfTrip(trip);
+  const acts = await getActivitiesByTrip(trip.id);
+  const stays = await getStaysByTrip(trip.id);
+
+  const totalCost = acts.reduce((s, a) => s + (Number(a.cost) || 0), 0)
+                  + stays.reduce((s, x) => s + (Number(x.cost) || 0), 0);
+  const budget = Number(trip.budget) || 0;
+
+  // Hero content
+  let heroDayText, heroDateText;
+  if (info?.status === 'current') {
+    heroDayText = `Day ${info.day} of ${trip.days}`;
+    heroDateText = addDaysLabel(trip.startDate, info.day - 1);
+  } else if (info?.status === 'before') {
+    heroDayText = info.daysUntil === 1 ? 'Trip starts tomorrow' : `Trip in ${info.daysUntil} days`;
+    heroDateText = addDaysLabel(trip.startDate, 0);
+  } else if (info?.status === 'after') {
+    heroDayText = 'Trip ended';
+    heroDateText = addDaysLabel(trip.startDate, trip.days - 1);
+  } else {
+    heroDayText = trip.name;
+    heroDateText = '';
+  }
+
+  // Today's activities
+  let todayActs = [];
+  let todayStay = null;
+  if (info?.status === 'current') {
+    todayActs = acts
+      .filter(a => a.day === info.day)
+      .sort((a, b) => (a.time || '').localeCompare(b.time || ''));
+    todayStay = stays.find(s => {
+      const cin = s.checkInDay || 1;
+      const nights = s.nights || 1;
+      return info.day >= cin && info.day <= cin + nights;
+    });
+  }
+
+  const todayCost = todayActs.reduce((s, a) => s + (Number(a.cost) || 0), 0);
+  const todayCount = todayActs.length;
+
+  // Up next (next uncompleted activity)
+  const now = new Date();
+  const nowHM = String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0');
+  const upNext = todayActs.find(a => !a.completed && (a.time || '99:99') >= nowHM);
+
+  // Weather (uses trip coords)
+  let weatherHtml = '';
+  let lat = trip.lat, lng = trip.lng;
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+    const withCoord = acts.find(a => Number.isFinite(a.lat) && Number.isFinite(a.lng));
+    if (withCoord) { lat = withCoord.lat; lng = withCoord.lng; }
+  }
+  if (info?.status === 'current' && Number.isFinite(lat) && Number.isFinite(lng)) {
+    try {
+      const forecast = await window.Weather.fetchForecast(lat, lng, trip.startDate, trip.days);
+      if (forecast && !forecast.unavailable && forecast.days) {
+        const wd = forecast.days[info.day - 1];
+        if (wd) {
+          weatherHtml = `
+            <div class="th-weather">
+              <span class="tw-icon">${window.Weather.weatherIcon(wd.code)}</span>
+              <div>
+                <div style="font-weight:600">${wd.tmax}° / ${wd.tmin}°</div>
+                <div style="font-size:11.5px;opacity:0.8">${wd.rain != null ? wd.rain + '% rain' : 'Clear'}</div>
+              </div>
+            </div>
+          `;
+        }
+      }
+    } catch (e) { /* no weather is fine */ }
+  }
+
+  let mainContent = '';
+  if (info?.status === 'current') {
+    if (todayStay) {
+      mainContent += `
+        <div class="today-section-title">Staying at</div>
+        <div class="today-upnext">
+          <div class="un-time">🏨</div>
+          <div class="un-body">
+            <div class="un-title">${escapeHtml(todayStay.name)}</div>
+            <div class="un-sub">${escapeHtml(todayStay.address || 'No address')}</div>
+          </div>
+        </div>`;
+    }
+    if (upNext) {
+      mainContent += `
+        <div class="today-section-title">Up next</div>
+        <div class="today-upnext" data-act-id="${upNext.id}" style="cursor:pointer">
+          <div class="un-time">${escapeHtml(upNext.time || '')}</div>
+          <div class="un-body">
+            <div class="un-title">${CATEGORY_EMOJI[upNext.category] || '📌'} ${escapeHtml(upNext.name)}</div>
+            <div class="un-sub">${escapeHtml(upNext.location || upNext.description || '')}</div>
+          </div>
+        </div>`;
+    } else if (todayCount > 0) {
+      mainContent += `<div class="today-section-title">Today's remaining plan</div>
+        <div class="today-empty">All ${todayCount} activit${todayCount === 1 ? 'y' : 'ies'} for today are done or scheduled earlier.</div>`;
+    } else {
+      mainContent += `<div class="today-section-title">Today's plan</div>
+        <div class="today-empty">Nothing scheduled for today. Tap the ＋ button to log an expense.</div>`;
+    }
+
+    if (todayActs.length) {
+      mainContent += `<div class="today-section-title">All of today</div>
+        <div class="schedule">
+          <div class="day-block">
+            <div class="activity-list">
+              ${todayActs.map(a => renderActivity(a)).join('')}
+            </div>
+          </div>
+        </div>`;
+    }
+  } else if (info?.status === 'before') {
+    mainContent += `<div class="today-empty">Your trip hasn't started yet. Check the Schedule tab to plan.</div>`;
+  } else {
+    mainContent += `<div class="today-empty">This trip has ended. Total spent: ${fmtMoney(totalCost)}.</div>`;
+  }
+
+  container.innerHTML = `
+    <div class="today-hero">
+      <div class="th-label">${trip.name}</div>
+      <h2 class="th-day">${heroDayText}</h2>
+      <div class="th-date">${escapeHtml(heroDateText)}</div>
+      ${weatherHtml}
+      <div class="th-stats">
+        <div class="th-stat">
+          <div class="ts-label">Today spent</div>
+          <div class="ts-value">${fmtMoney(todayCost)}</div>
+        </div>
+        <div class="th-stat">
+          <div class="ts-label">Trip total</div>
+          <div class="ts-value">${fmtMoney(totalCost)}</div>
+        </div>
+        <div class="th-stat">
+          <div class="ts-label">${budget > 0 ? 'Budget left' : 'Activities'}</div>
+          <div class="ts-value">${budget > 0 ? fmtMoney(Math.max(0, budget - totalCost)) : acts.length}</div>
+        </div>
+      </div>
+    </div>
+    ${mainContent}
+  `;
+
+  // Wire up-next click → schedule tab, scroll to activity
+  container.querySelectorAll('.today-upnext[data-act-id]').forEach(el => {
+    el.addEventListener('click', () => switchTab('schedule'));
+  });
+
+  // Wire activity action buttons inside the "all of today" list
+  container.querySelectorAll('button[data-action]').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const action = btn.dataset.action;
+      const id = Number(btn.dataset.id);
+      if (action === 'edit') return openActivityForm(id);
+      if (action === 'delete') return handleDeleteActivity(id);
+      if (action === 'toggle') return handleToggleComplete(id);
+      if (action === 'preview-attachment') return openAttachmentPreview(id);
+    });
+  });
+}
+
+/* =============================================================
+ * QUICK EXPENSE FAB
+ * ============================================================= */
+function openQuickExpense() {
+  if (!state.currentTripId) {
+    toast('Open a trip first', 'error');
+    return;
+  }
+  const modal = document.getElementById('quick-expense-modal');
+  const form = document.getElementById('quick-expense-form');
+  form.reset();
+  document.getElementById('qe-add-receipt').checked = false;
+  state.pendingQuickReceipt = null;
+
+  // Prefill day = today's day of trip if we're mid-trip, else 1
+  getTrip(state.currentTripId).then(trip => {
+    if (!trip) return;
+    const info = currentDayOfTrip(trip);
+    const day = info?.status === 'current' ? info.day : 1;
+    document.getElementById('qe-day').value = day;
+    document.getElementById('qe-day').max = trip.days;
+  });
+
+  modal.classList.remove('hidden');
+  setTimeout(() => document.getElementById('qe-amount').focus(), 60);
+}
+
+function closeQuickExpense() {
+  document.getElementById('quick-expense-modal').classList.add('hidden');
+  state.pendingQuickReceipt = null;
+}
+
+async function handleQuickExpenseSubmit(e) {
+  e.preventDefault();
+  const trip = await getTrip(state.currentTripId);
+  if (!trip) return;
+
+  const amount = parseFloat(document.getElementById('qe-amount').value);
+  const label = document.getElementById('qe-label').value.trim();
+  const category = document.getElementById('qe-category').value;
+  const day = parseInt(document.getElementById('qe-day').value, 10) || 1;
+
+  if (!amount || !label) {
+    toast('Fill amount + label', 'error');
+    return;
+  }
+
+  const now = new Date();
+  const nowHM = String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0');
+
+  const activityId = newId();
+  await saveActivity({
+    id: activityId,
+    tripId: trip.id,
+    name: label,
+    description: '',
+    day,
+    time: nowHM,
+    duration: 30,
+    cost: amount,
+    travelTime: 0,
+    location: '',
+    category,
+    lat: null, lng: null,
+    completed: true,       // Quick expense = already happened
+    createdAt: Date.now(),
+    isQuickExpense: true,
+  });
+
+  // Attach receipt if provided
+  if (state.pendingQuickReceipt) {
+    const f = state.pendingQuickReceipt;
+    if (f.size <= MAX_ATTACHMENT_SIZE) {
+      const attId = newId() + Math.floor(Math.random() * 1000);
+      const rec = {
+        id: attId,
+        tripId: trip.id,
+        parentKey: parentKey('activity', activityId),
+        parentKind: 'activity',
+        parentId: activityId,
+        name: f.name || `receipt-${Date.now()}.jpg`,
+        type: f.type || 'image/jpeg',
+        size: f.size,
+        blob: f,
+        createdAt: Date.now(),
+      };
+      await saveAttachment(rec);
+      uploadAttachmentToCloud(rec).catch(() => {});
+    } else {
+      toast('Receipt too big (max 5 MB) — expense saved without it', '');
+    }
+  }
+
+  toast(`Logged ${fmtMoney(amount)}`, 'success');
+  closeQuickExpense();
+  if (state.currentTab === 'today') renderTodayTab();
+  else if (state.currentView === 'trip-detail') renderTripDetail();
 }
 
 /* =============================================================
@@ -2844,12 +3169,22 @@ async function commitPendingAttachments(kind, parentId, tripId) {
   const existingOnServer = await getAttachmentsForParent(kind, parentId);
   const keptIds = new Set(state.pendingAttachments.filter(a => a._existing).map(a => a.id));
   for (const srv of existingOnServer) {
-    if (!keptIds.has(srv.id)) await deleteAttachment(srv.id);
+    if (!keptIds.has(srv.id)) {
+      await deleteAttachment(srv.id);
+      // Also delete from cloud
+      if (state.user && srv.storagePath) {
+        try {
+          await state.storage.ref(srv.storagePath).delete();
+          await attachmentsCol(tripId).doc(String(srv.id)).delete();
+        } catch (e) { console.warn('Cloud attachment delete failed:', e); }
+      }
+    }
   }
   for (const a of state.pendingAttachments) {
     if (a._existing) continue;
-    await saveAttachment({
-      id: newId() + Math.floor(Math.random() * 1000),
+    const attId = newId() + Math.floor(Math.random() * 1000);
+    const rec = {
+      id: attId,
       tripId,
       parentKey: parentKey(kind, parentId),
       parentKind: kind,
@@ -2859,13 +3194,171 @@ async function commitPendingAttachments(kind, parentId, tripId) {
       size: a.size,
       blob: a.blob,
       createdAt: Date.now(),
+    };
+    await saveAttachment(rec);
+    // Try to upload to cloud; if it fails (e.g. Storage not enabled), the
+    // attachment still works locally and can be uploaded later.
+    uploadAttachmentToCloud(rec).catch(err => {
+      console.warn('Cloud upload failed for', a.name, err);
     });
+  }
+}
+
+/* ---------- Firebase Storage sync for attachments ---------- */
+function attachmentsCol(tripId) {
+  return tripDoc(tripId).collection('attachments');
+}
+
+async function uploadAttachmentToCloud(att) {
+  if (!state.user || !state.storage) return;
+  const storagePath = `attachments/${att.tripId}/${att.id}`;
+  const ref = state.storage.ref(storagePath);
+
+  try {
+    await ref.put(att.blob, {
+      contentType: att.type || 'application/octet-stream',
+      customMetadata: {
+        name: att.name,
+        tripId: String(att.tripId),
+        parentKind: att.parentKind,
+        parentId: String(att.parentId),
+      },
+    });
+    const downloadURL = await ref.getDownloadURL();
+
+    // Save metadata to Firestore
+    await attachmentsCol(att.tripId).doc(String(att.id)).set({
+      id: att.id,
+      tripId: att.tripId,
+      parentKey: att.parentKey,
+      parentKind: att.parentKind,
+      parentId: att.parentId,
+      name: att.name,
+      type: att.type,
+      size: att.size,
+      storagePath,
+      downloadURL,
+      uploadedBy: state.user.uid,
+      createdAt: att.createdAt,
+      updatedAt: Date.now(),
+    });
+    try { await state.firestore.waitForPendingWrites(); } catch (e) {}
+
+    // Mark locally that this att has been uploaded
+    const local = await getAttachment(att.id);
+    if (local) {
+      local.storagePath = storagePath;
+      local.downloadURL = downloadURL;
+      local.uploadedBy = state.user.uid;
+      await reqP(tx(STORE_ATTACHMENTS, 'readwrite').put(local));
+    }
+    console.log('[storage] Uploaded:', att.name);
+    return downloadURL;
+  } catch (err) {
+    if (err.code === 'storage/unauthorized') {
+      toast('Storage rules block uploads. See README for rules.', 'error');
+    } else if (err.code === 'storage/unknown' || err.code === 'storage/object-not-found') {
+      toast('Firebase Storage not enabled. Attachments stay device-local.', '');
+    } else {
+      console.error('[storage] upload failed:', err);
+    }
+    throw err;
+  }
+}
+
+async function downloadAttachmentFromCloud(meta) {
+  if (!state.user || !state.storage) return null;
+  try {
+    const ref = state.storage.ref(meta.storagePath);
+    // Get bytes via fetch of downloadURL (works around CORS if configured)
+    const url = meta.downloadURL || await ref.getDownloadURL();
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error('Fetch failed: ' + resp.status);
+    const blob = await resp.blob();
+    return blob;
+  } catch (err) {
+    console.warn('[storage] download failed:', err);
+    return null;
+  }
+}
+
+/**
+ * On sign-in, upload any local attachments that haven't been uploaded yet.
+ */
+async function backfillAttachmentsToCloud() {
+  if (!state.user || !state.storage) return;
+  // Find all local attachments without storagePath
+  const all = await new Promise((resolve, reject) => {
+    const req = tx(STORE_ATTACHMENTS).getAll();
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+  const pending = all.filter(a => !a.storagePath && a.blob);
+  if (!pending.length) return;
+  console.log(`[storage] Backfilling ${pending.length} local attachments to cloud`);
+  toast(`Uploading ${pending.length} attachment${pending.length === 1 ? '' : 's'}…`);
+  let ok = 0, fail = 0;
+  for (const att of pending) {
+    try {
+      await uploadAttachmentToCloud(att);
+      ok++;
+    } catch (e) { fail++; }
+  }
+  if (ok) toast(`Uploaded ${ok} attachment${ok === 1 ? '' : 's'}` + (fail ? ` (${fail} failed)` : ''), 'success');
+}
+
+/**
+ * Fetch attachment metadata from Firestore (via listener) and download blobs
+ * we don't have locally.
+ */
+async function syncAttachmentMetadata(tripId) {
+  if (!state.user || !state.firestore) return;
+  try {
+    const snap = await attachmentsCol(tripId).get({ source: 'server' });
+    for (const doc of snap.docs) {
+      const meta = doc.data();
+      meta.id = Number(doc.id);
+      const local = await getAttachment(meta.id);
+      if (local && local.blob) {
+        // Already have file; just update metadata
+        local.storagePath = meta.storagePath;
+        local.downloadURL = meta.downloadURL;
+        local.uploadedBy = meta.uploadedBy;
+        await reqP(tx(STORE_ATTACHMENTS, 'readwrite').put(local));
+      } else {
+        // Download the blob into local cache
+        const blob = await downloadAttachmentFromCloud(meta);
+        if (blob) {
+          await reqP(tx(STORE_ATTACHMENTS, 'readwrite').put({
+            ...meta,
+            blob,
+          }));
+          console.log('[storage] Downloaded:', meta.name);
+        } else {
+          // Save metadata-only so preview shows "download failed"
+          await reqP(tx(STORE_ATTACHMENTS, 'readwrite').put({ ...meta, blob: null }));
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('[storage] metadata sync failed for trip', tripId, err);
   }
 }
 
 async function openAttachmentPreview(id) {
   const a = await getAttachment(id);
-  if (!a) return;
+  if (!a) { toast('Attachment not found', 'error'); return; }
+  if (!a.blob) {
+    // Metadata-only — try downloading now
+    toast('Downloading…');
+    const blob = await downloadAttachmentFromCloud(a);
+    if (!blob) {
+      toast('Could not download attachment', 'error');
+      return;
+    }
+    a.blob = blob;
+    await reqP(tx(STORE_ATTACHMENTS, 'readwrite').put(a));
+  }
   openAttachmentPreviewFromBlob(a);
 }
 
@@ -3675,6 +4168,30 @@ function wireEvents() {
   document.getElementById('sync-debug-close').addEventListener('click', hideSyncDebug);
   document.getElementById('sync-debug-refresh').addEventListener('click', forceRefreshFromCloud);
   document.getElementById('rules-check-btn').addEventListener('click', runRulesHealthCheck);
+
+  // Quick expense FAB
+  document.getElementById('fab-expense').addEventListener('click', openQuickExpense);
+  document.getElementById('quick-expense-form').addEventListener('submit', handleQuickExpenseSubmit);
+  document.getElementById('qe-cancel').addEventListener('click', closeQuickExpense);
+  document.getElementById('quick-expense-modal').addEventListener('click', (e) => {
+    if (e.target.id === 'quick-expense-modal') closeQuickExpense();
+  });
+  document.getElementById('qe-add-receipt').addEventListener('change', (e) => {
+    if (e.target.checked) {
+      document.getElementById('qe-receipt-file').click();
+    } else {
+      state.pendingQuickReceipt = null;
+    }
+  });
+  document.getElementById('qe-receipt-file').addEventListener('change', (e) => {
+    const f = e.target.files[0];
+    if (f) {
+      state.pendingQuickReceipt = f;
+      toast(`📷 ${f.name} attached`, '');
+    } else {
+      document.getElementById('qe-add-receipt').checked = false;
+    }
+  });
 
   // Header refresh button — visible whenever signed in
   document.getElementById('refresh-btn').addEventListener('click', async () => {
